@@ -1,43 +1,43 @@
 joy:
   ros__parameters:
     # device_name: /dev/input/joypad-f710
-    device_id: 0
-    deadzone: 0.01
-    autorepeat_rate: 20.0
-    coalesce_interval: 0.01
+    device_id: 0                                    #按顺序选择第一个可用的Joy,适用于多手柄
+    deadzone: 0.01                                  #忽略摇杆在+-0.01内的微小抖动，避免噪声产生微动作
+    autorepeat_rate: 20.0                           #在手柄保持不变时仍以20HZ频率发布消息，保证下游持续接收控制信号
+    coalesce_interval: 0.01                         #将10ms内的手柄事件合成一帧发布，降低消息数量和保证响应性
 
 joy_teleop:
   ros__parameters:
     default:
       type: topic
-      interface_type: ackermann_msgs/msg/AckermannDriveStamped
-      topic_name: teleop
-      axis_mappings:
-        drive-speed:
-          axis: 1
-          scale: 0.0
+      interface_type: ackermann_msgs/msg/AckermannDriveStamped      #用于控制的消息类型，包含车辆的速度、方向等信息
+      topic_name: teleop                            #用于遥控控制的话题，通过这个话题系统会接受来自手柄的控制命令
+      axis_mappings:                                #轴映射，摇杆每个位置对应什么动作
+        drive-speed:                                #速度控制
+          axis: 1                                   #手柄左摇杆
+          scale: 0.0                
           offset: 0.0
-        drive-steering_angle:
-          axis: 2
+        drive-steering_angle:                       #方向控制
+          axis: 2                                   #手柄右摇杆
           scale: 0.0
           offset: 0.0
 
-    human_control:
+    human_control:                                  #人工驾驶模式
       type: topic
-      interface_type: ackermann_msgs/msg/AckermannDriveStamped
-      topic_name: teleop
-      deadman_buttons: [4]
-      axis_mappings:
-        drive-speed:
+      interface_type: ackermann_msgs/msg/AckermannDriveStamped        #用于控制的消息类型，包含车辆的速度、方向等信息
+      topic_name: teleop                             #用于遥控控制的话题，通过这个话题系统会接受来自手柄的控制命令
+      deadman_buttons: [4]                           #死区建，按下时按设定比例生成Ackermann命令
+      axis_mappings:                                 #轴映射，摇杆每个位置对应什么动作
+        drive-speed:                                 #速度控制
           axis: 1
-          scale: 5.0
-          offset: 0.0
-        drive-steering_angle:
+          scale: 5.0                                 #左摇杆上下归一化
+          offset: 0.0         
+        drive-steering_angle:                        #手柄右摇杆
           axis: 2
           scale: 0.34
           offset: 0.0
 
-    autonomous_control:
+    autonomous_control:                              #自动驾驶模式,未来扩展
       type: topic
       interface_type: std_msgs/msg/Int8
       topic_name: /dev/null
