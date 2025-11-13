@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>pointcloud_to_laserscan</name>
+  <version>2.0.1</version>
+  <description>Converts a 3D Point Cloud into a 2D laser scan. This is useful for making devices like the Kinect appear like a laser scanner for 2D-based algorithms (e.g. laser-based SLAM).</description>
+
+  <maintainer email="paul@bovbel.com">Paul Bovbel</maintainer>
+  <maintainer email="michel@ekumenlabs.com">Michel Hidalgo</maintainer>
+  <author email="paul@bovbel.com">Paul Bovbel</author>
+  <author email="michel@ekumenlabs.com">Michel Hidalgo</author>
+  <author>Tully Foote</author>
+
+  <license>BSD</license>
+
+  <url type="website">http://ros.org/wiki/perception_pcl</url>
+  <url type="bugtracker">ros-perception/perception_pcl</url>
+  <url type="repository">GitHub - ros-perception/perception_pcl: PCL (Point Cloud Library) ROS interface stack</url>
+
+  <!-- 使用 ament_cmake_auto；如果后续改成手写 CMake，可把它换成 ament_cmake -->
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+
+  <!-- 明确声明用到的库（build & exec 分开写更稳妥） -->
+  <build_depend>rclcpp</build_depend>
+  <build_depend>rclcpp_components</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>tf2_sensor_msgs</build_depend>
+  <build_depend>laser_geometry</build_depend>
+  <build_depend>message_filters</build_depend>
+  <build_depend>pluginlib</build_depend>
+
+  <exec_depend>rclcpp</exec_depend>
+  <exec_depend>rclcpp_components</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_sensor_msgs</exec_depend>
+  <exec_depend>laser_geometry</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>pluginlib</exec_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_cmake_cppcheck</test_depend>
+  <test_depend>ament_cmake_cpplint</test_depend>
+  <test_depend>ament_cmake_flake8</test_depend>
+  <test_depend>ament_cmake_lint_cmake</test_depend>
+  <test_depend>ament_cmake_pep257</test_depend>
+  <test_depend>ament_cmake_uncrustify</test_depend>
+  <test_depend>ament_cmake_xmllint</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
