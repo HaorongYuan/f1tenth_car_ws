@@ -196,5 +196,7 @@ def generate_launch_description():
     # ld.add_action(urg_node)
     ld.add_action(ackermann_mux_node)
     ld.add_action(static_tf_node)
+    # ld.add_action(mid360_node)
+    ld.add_action(pointcloud_to_laserscan_node)
 
     return ld
