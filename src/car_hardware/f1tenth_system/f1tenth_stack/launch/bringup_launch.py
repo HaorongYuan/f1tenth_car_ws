@@ -186,6 +186,18 @@ def generate_launch_description():
         arguments=['0.27', '0.0', '0.11', '0.0', '0.0', '0.0', 'base_link', 'livox_frame']
     )
 
+
+    twist_to_ackermann_node = Node(
+            package='twist_to_ackermann',
+            executable='twist_to_ackermann_node',
+            name='twist_to_ackermann',
+            output='screen',
+            parameters=[
+                {'cmd_vel_topic': '/cmd_vel'},
+                {'drive_topic': '/drive'}
+            ]
+    )
+
     # finalize
     ld.add_action(joy_node)
     ld.add_action(joy_teleop_node)
@@ -198,5 +210,6 @@ def generate_launch_description():
     ld.add_action(static_tf_node)
     # ld.add_action(mid360_node)
     ld.add_action(pointcloud_to_laserscan_node)
+    ld.add_action(twist_to_ackermann_node)
 
     return ld
