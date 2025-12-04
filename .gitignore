@@ -4,5 +4,5 @@
 /log/
 
 #忽略所有 .pyc 编译文件
-echo "*.pyc" >> .gitignore          # 忽略所有 .pyc 编译文件
-echo "__pycache__/" >> .gitignore   # 忽略 __pycache__ 目录
+*.pyc          # 忽略所有 .pyc 编译文件
+__pycache__/   # 忽略所有 __pycache__ 目录
