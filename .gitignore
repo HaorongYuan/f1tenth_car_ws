@@ -1,8 +1,45 @@
-# 忽略 colcon 构建产物
+# ROS 2 / colcon build artifacts
 /build/
 /install/
 /log/
 
-#忽略所有 .pyc 编译文件
-*.pyc          # 忽略所有 .pyc 编译文件
-__pycache__/   # 忽略所有 __pycache__ 目录
+# C/C++ build and cache
+*.o
+*.so
+*.a
+*.out
+*.dSYM/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Runtime / temp
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# ROS bag and dataset artifacts (usually large, keep out of git by default)
+*.bag
+*.db3
+*.mcap
+*.pcap
