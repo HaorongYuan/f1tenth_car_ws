@@ -20,8 +20,8 @@
     speed_max: 23250.0
     position_min: 0.0
     position_max: 0.0
-    servo_min: 0.10                                              #舵机占空比下限
-    servo_max: 0.95                                              #舵机占空比上限
+    servo_min: 0.00                                              #舵机占空比下限
+    servo_max: 1.00                                              #舵机占空比上限
 
 # No longer needed, all parameters are shared
 # ackermann_to_vesc_node:

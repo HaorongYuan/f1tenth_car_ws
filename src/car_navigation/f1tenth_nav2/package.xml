@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>f1tenth_nav2</name>
+  <version>0.0.1</version>
+  <description>F1TENTH Nav2 bringup resources (launch/config/rviz/maps).</description>
+
+  <maintainer email="jetson@todo.todo">jetson</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- launch -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <!-- nav2 -->
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+
+  <!-- rviz (如果你的 launch 会起 rviz，或你要用 nav2 rviz 插件就加上) -->
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>nav2_rviz_plugins</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

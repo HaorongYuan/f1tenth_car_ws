@@ -46,7 +46,7 @@ private:
     theta_rad_ = theta_degrees_ * M_PI / 180.0;
 
     steering_angle_limit_ = this->declare_parameter("steering_angle_limit", 0.4);
-    max_speed_ = this->declare_parameter("max_speed", 3.0);
+    max_speed_ = this->declare_parameter("max_speed", 0.5);
     min_speed_ = this->declare_parameter("min_speed", 0.5);
     speed_reduction_gain_ = this->declare_parameter("speed_reduction_gain", 1.0);
     brake_speed_ = this->declare_parameter("brake_speed", 1.0);
