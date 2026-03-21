@@ -59,15 +59,6 @@ class BattleVehicleNode(Node):
         self.dynamic_obs = False
         self.chaoche = False
 
-        # === 【新增】 保护型倒车参数 ===
-        self.reverse_counter = 0        # 倒车计时器
-        
-        # 雷达频率约 10HZ
-        self.REVERSE_TOTAL_LIMIT = 15   # 总倒车流程：约 1.5 - 2 秒
-        self.BRAKE_LIMIT = 4           # 前 10 帧 (约0.3-0.5秒) 为刹车缓冲期
-        
-        self.STUCK_THRESHOLD = 0.3      # 触发距离 (米)
-        self.REVERSE_SPEED = -1.0       # 倒车速度
 
         # === ROS 2 通信配置 ===
         qos_profile = QoSProfile(
@@ -644,33 +635,6 @@ class BattleVehicleNode(Node):
             """)
             print("speed:",drive_msg.drive.speed)
 
-            #  齿轮保护型倒车逻辑
-        # =========================================================
-        # 1. 触发检测
-        if self.reverse_counter == 0:
-            if max_dis < self.STUCK_THRESHOLD:
-                self.get_logger().warn(f"🛑 受困！准备倒车 (前方 {max_dis:.2f}m)...")
-                self.reverse_counter = self.REVERSE_TOTAL_LIMIT # 启动计时
-
-        # 2. 执行倒车流程 (如果计时器 > 0)
-        if self.reverse_counter > 0:
-            self.reverse_counter -= 1 # 倒计时递减
-
-            # === 阶段一：刹车/缓冲期 (前10帧) ===
-            # 逻辑：剩余时间 > (总时间 - 刹车时间)
-            if self.reverse_counter > (self.REVERSE_TOTAL_LIMIT - self.BRAKE_LIMIT):
-                drive_msg.drive.speed = 0.0          # 速度归零
-                drive_msg.drive.steering_angle = 0.0 # 舵机回正 (可选，防止摆动)
-                
-                print(f"\033[33m >>> 正在刹车缓冲... 保护齿轮 (剩余 {self.reverse_counter}) \033[0m")
-
-            # === 阶段二：倒车脱困期 (剩下的时间) ===
-            else:
-                drive_msg.drive.speed = float(self.REVERSE_SPEED)     # 给负速度
-                drive_msg.drive.steering_angle = -float(steering_angle) # 反向打舵
-                
-                print(f"\033[41;37m >>> 全速倒车脱困!!! (剩余 {self.reverse_counter}) \033[0m")
-        # =========================================================
         
         self.drive_pub.publish(drive_msg)
 
