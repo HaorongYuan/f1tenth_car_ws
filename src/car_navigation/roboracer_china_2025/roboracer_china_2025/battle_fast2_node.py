@@ -1,17 +1,21 @@
 #! /usr/bin/env python3
 #coding=utf-8
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-import math
-import numpy as np
-from sensor_msgs.msg import LaserScan
-from ackermann_msgs.msg import AckermannDriveStamped
-from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point
-from builtin_interfaces.msg import Duration
 import copy
+import math
+import time
+
+import numpy as np
+import rclpy
+from ackermann_msgs.msg import AckermannDriveStamped
+from builtin_interfaces.msg import Duration
+from geometry_msgs.msg import Point
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool, Float32, UInt8, UInt32
+from visualization_msgs.msg import Marker
 
 # === 保持原代码的常量定义不变 ===
 DIR_DETECT_THRESHOLD = 2.5 # 方向探测距离,用于方向判断
@@ -25,182 +29,288 @@ START_ANGLE = -60
 END_ANGLE = 60
 MIN_OBS_SPEED = 1.0
 
+
+# 控制模式编码: 0=纯启发式, 1=MPC仅接管转向, 2=MPC接管转向+速度, 3=MPC失败后的回退模式
+CONTROL_MODE_HEURISTIC = 0
+CONTROL_MODE_MPC_STEER = 1
+CONTROL_MODE_MPC_FULL = 2
+CONTROL_MODE_FALLBACK = 3
+
+
 class BattleVehicleNode(Node):
     def __init__(self):
         super().__init__('wall_following2')
-        
-        # === 【新增】实车参数声明 (参考 battle_fast2_node.py) ===
-        # 默认值保持你代码里的原样，但现在可以在 launch 文件里改了
+
+        # ---- 话题参数: scan前端输入、最终控制输出、可视化调试与里程计输入 ----
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('drive_topic', '/drive')
         self.declare_parameter('marker_topic', '/arrow_marker_02')
         self.declare_parameter('debug_scan_topic', '/front_scan_02')
+        self.declare_parameter('odom_topic', '/odom')
 
+        # ---- MPC参数: 模式开关、时域长度、步长、候选离散度与速度/加速度边界 ----
+        self.declare_parameter('mpc_enable', False)
+        self.declare_parameter('mpc_mode', 'off')  # off | steer_only | full
+        self.declare_parameter('mpc_timeout_ms', 8.0)
+        self.declare_parameter('wheelbase', 0.25)
+        self.declare_parameter('horizon', 8)
+        self.declare_parameter('dt', 0.1)
+        self.declare_parameter('mpc_steer_candidates', 11)
+        self.declare_parameter('mpc_accel_candidates', 7)
+        self.declare_parameter('mpc_max_speed', 2.0)
+        self.declare_parameter('mpc_min_speed', 0.0)
+        self.declare_parameter('mpc_max_accel', 2.0)
+        self.declare_parameter('mpc_max_decel', -2.0)
+
+        # Phase 2 速度边界参数: Follow限速、超车限速、最终输出硬上限。
+        self.declare_parameter('follow_speed_cap', 1.0)
+        self.declare_parameter('chaoche_speed_cap', 2.0)
+        self.declare_parameter('final_speed_cap', 4.0)
+
+        # ---- Phase 3诊断参数: 控制台打印频率与统计发布开关 ----
+        self.declare_parameter('diag_print_hz', 2.0)
+        self.declare_parameter('publish_diag_topics', True)
+
+
+        # 读取话题参数（用于ROS接口接线）
         scan_topic = self.get_parameter('scan_topic').value
         drive_topic = self.get_parameter('drive_topic').value
         marker_topic = self.get_parameter('marker_topic').value
         debug_scan_topic = self.get_parameter('debug_scan_topic').value
+        odom_topic = self.get_parameter('odom_topic').value
 
-        self.get_logger().info(f"Battle Node Started. Topics: scan={scan_topic}, drive={drive_topic}")
+        # 读取MPC运行参数（用于控制器行为与计算预算）
+        self.mpc_enable = bool(self.get_parameter('mpc_enable').value)
+        self.mpc_mode = str(self.get_parameter('mpc_mode').value)
+        self.mpc_timeout_ms = float(self.get_parameter('mpc_timeout_ms').value)
+        self.wheelbase = max(0.05, float(self.get_parameter('wheelbase').value))
+        self.mpc_horizon = max(3, int(self.get_parameter('horizon').value))
+        self.mpc_dt = max(0.02, float(self.get_parameter('dt').value))
+        self.mpc_steer_candidates = max(5, int(self.get_parameter('mpc_steer_candidates').value))
+        self.mpc_accel_candidates = max(3, int(self.get_parameter('mpc_accel_candidates').value))
+        self.mpc_max_speed = float(self.get_parameter('mpc_max_speed').value)
+        self.mpc_min_speed = float(self.get_parameter('mpc_min_speed').value)
+        self.mpc_max_accel = float(self.get_parameter('mpc_max_accel').value)
+        self.mpc_max_decel = float(self.get_parameter('mpc_max_decel').value)
 
-        # === 将原代码的 global 变量初始化为类成员变量 ===
-        self.last_angle = 0
+        # Phase 2 速度边界读取: 用于MPC求解上界与最终输出限幅。
+        self.follow_speed_cap = float(self.get_parameter('follow_speed_cap').value)
+        self.chaoche_speed_cap = float(self.get_parameter('chaoche_speed_cap').value)
+        self.final_speed_cap = float(self.get_parameter('final_speed_cap').value)
+
+        # Phase 3诊断参数读取: 用于实时观测打印与话题统计发布。
+        self.diag_print_hz = max(0.2, float(self.get_parameter('diag_print_hz').value))
+        self.publish_diag_topics = bool(self.get_parameter('publish_diag_topics').value)
+
+
+        self.get_logger().info(
+            f"Battle Node Started. scan={scan_topic}, drive={drive_topic}, odom={odom_topic}, "
+            f"mpc_enable={self.mpc_enable}, mpc_mode={self.mpc_mode}"
+        )
+
+        # ---- 反应式前端状态: 保持与原battle_fast2一致，用于方向选择/避障/Follow/chaoche ----
+        # === 原逻辑成员变量 ===
+        self.last_angle = 0.0
         self.last_max_dir_index = 0
-        self.GO_STARIGHT = 0 # 是否进入直道路段
-        self.TRANSITION = 0 # 是否进入过渡路段
-        self.last_in_normol = False   # 记录上一次循环是否进入隐藏款
-        self.last_in_straight = False  # 记录上一次循环是否进入直道路段
-        self.speed_rate = 1.0         # 速度比例因子，初始为1.0
+        self.GO_STARIGHT = 0
+        self.TRANSITION = 0
+        self.last_in_normol = False
+        self.last_in_straight = False
+        self.speed_rate = 1.0
         self.straight_cnt = 0
         self.Follow = False
-        self.turn_rate = 1.0 # 转向比例因子
+        self.turn_rate = 1.0
         self.P = 1.1
         self.D = 0.2
         self.dynamic_obs = False
         self.chaoche = False
 
+        # ---- 新增控制后端状态: odom缓存 + MPC上一帧输出 + 当前模式 ----
+        # === Odom 与控制状态 ===
+        self.have_odom = False
+        self.odom_speed = 0.0
+        self.odom_yaw = 0.0
+        self.last_mpc_steer = 0.0
+        self.last_mpc_speed = 0.0
+        self.last_control_mode = CONTROL_MODE_HEURISTIC
 
-        # === ROS 2 通信配置 ===
+        # 记录本帧MPC速度上界和回退原因，便于调参与问题定位。
+        self.current_speed_upper_bound = self.mpc_max_speed
+        self.last_mpc_reason = 'init'
+
+        # Phase 3统计状态: 求解耗时、回退触发率、模式切换次数等运行指标。
+        self.control_cycle_count = 0
+        self.mpc_attempt_count = 0
+        self.mpc_success_count = 0
+        self.fallback_trigger_count = 0
+        self.mode_switch_count = 0
+        self.last_solve_time_ms = 0.0
+        self.max_solve_time_ms = 0.0
+        self.sum_solve_time_ms = 0.0
+
+
+        # 激光链路使用BEST_EFFORT，降低高频扫描数据阻塞风险。
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10
         )
 
-        # 订阅雷达 (使用参数 scan_topic)
-        self.scan_sub = self.create_subscription(
-            LaserScan, 
-            scan_topic, 
-            self.middle_line_callback, 
-            qos_profile)
-        
-        # 发布控制 (使用参数 drive_topic)
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, 
-            drive_topic, 
-            1)
-        
-        # 调试话题
-        self.scan_pub = self.create_publisher(
-            LaserScan, 
-            debug_scan_topic, 
-            10)
-        self.marker_pub = self.create_publisher(
-            Marker, 
-            marker_topic, 
-            1)
+        # 新增订阅: /scan驱动前端流程，/odom提供MPC状态估计。
+        self.scan_sub = self.create_subscription(LaserScan, scan_topic, self.middle_line_callback, qos_profile)
+        self.odom_sub = self.create_subscription(Odometry, odom_topic, self.odom_callback, 20)
 
-    # === 原样保留的辅助函数 (微调 publish_arrow_marker 适配 Frame ID) ===
+        # 发布最终控制到drive_topic；其余发布器用于调试和可视化。
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, drive_topic, 1)
+        self.scan_pub = self.create_publisher(LaserScan, debug_scan_topic, 10)
+        self.marker_pub = self.create_publisher(Marker, marker_topic, 1)
 
-    # 【修改】增加 frame_id 参数，不再硬编码 ego_racecar
-    def publish_arrow_marker(self, max_dir_index, frame_id="laser"):
+        # 调试输出: 启发式命令、MPC命令、模式码和MPC是否成功。
+        self.heuristic_pub = self.create_publisher(AckermannDriveStamped, 'battle_fast2/drive_heuristic', 10)
+        self.mpc_pub = self.create_publisher(AckermannDriveStamped, 'battle_fast2/drive_mpc', 10)
+        self.mode_pub = self.create_publisher(UInt8, 'battle_fast2/control_mode', 10)
+        self.mpc_ok_pub = self.create_publisher(Bool, 'battle_fast2/mpc_ok', 10)
+
+        # Phase 3诊断话题: 发布求解耗时、回退率、模式切换计数和当前车速。
+        self.solve_time_pub = self.create_publisher(Float32, 'battle_fast2/mpc_solve_time_ms', 10)
+        self.fallback_rate_pub = self.create_publisher(Float32, 'battle_fast2/fallback_rate', 10)
+        self.mode_switch_pub = self.create_publisher(UInt32, 'battle_fast2/mode_switch_count', 10)
+        self.current_speed_pub = self.create_publisher(Float32, 'battle_fast2/current_speed_mps', 10)
+
+
+        # 诊断定时器: 周期打印实时速度和统计信息，便于命令行观测。
+        self.diag_timer = self.create_timer(1.0 / self.diag_print_hz, self.diagnostic_timer_callback)
+
+    # Odom回调仅缓存当前速度与航向，不在此处直接发布控制。
+    def odom_callback(self, msg: Odometry):
+        self.have_odom = True
+        self.odom_speed = float(msg.twist.twist.linear.x)
+        qx = msg.pose.pose.orientation.x
+        qy = msg.pose.pose.orientation.y
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        self.odom_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+
+    # 预留接口: 接收外部safety节点状态，当前仅缓存用于观测。
+
+    # Phase 3诊断回调: 命令行只打印当前速度和MPC求解耗时。
+    def diagnostic_timer_callback(self):
+        self.get_logger().info(
+            f"speed={self.odom_speed:.2f}m/s solve={self.last_solve_time_ms:.2f}ms"
+        )
+
+        if self.publish_diag_topics:
+            solve_msg = Float32()
+            solve_msg.data = float(self.last_solve_time_ms)
+            self.solve_time_pub.publish(solve_msg)
+
+            fallback_rate = 0.0
+            if self.mpc_attempt_count > 0:
+                fallback_rate = self.fallback_trigger_count / float(self.mpc_attempt_count)
+
+            rate_msg = Float32()
+            rate_msg.data = float(fallback_rate)
+            self.fallback_rate_pub.publish(rate_msg)
+
+            switch_msg = UInt32()
+            switch_msg.data = int(self.mode_switch_count)
+            self.mode_switch_pub.publish(switch_msg)
+
+            speed_msg = Float32()
+            speed_msg.data = float(self.odom_speed)
+            self.current_speed_pub.publish(speed_msg)
+    def publish_arrow_marker(self, max_dir_index, frame_id='laser'):
         marker = Marker()
-        # 适配实车坐标系 (动态获取)
-        marker.header.frame_id = frame_id 
+        marker.header.frame_id = frame_id
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "direction_arrow"
+        marker.ns = 'direction_arrow'
         marker.id = 0
         marker.type = Marker.ARROW
         marker.action = Marker.ADD
-        
-        marker.points = []
+
         p0 = Point(x=0.0, y=0.0, z=0.0)
-        # 计算箭头终点，假定箭头长度为1
         angle_rad = math.radians(max_dir_index)
         p1 = Point(x=math.sin(angle_rad), y=math.cos(angle_rad), z=0.0)
-        marker.points.append(p0)
-        marker.points.append(p1)
-        marker.scale.x = 0.1  
-        marker.scale.y = 0.1  
-        marker.scale.z = 0.2  
+        marker.points = [p0, p1]
+        marker.scale.x = 0.1
+        marker.scale.y = 0.1
+        marker.scale.z = 0.2
         marker.color.a = 1.0
         marker.color.r = 0.1
-        marker.color.g = 1.0  # 绿色
+        marker.color.g = 1.0
         marker.color.b = 0.1
-
-        marker.lifetime = Duration(sec=0, nanosec=100000000) # 0.1s
+        marker.lifetime = Duration(sec=0, nanosec=100000000)
         self.marker_pub.publish(marker)
 
-    def get_dis(self, data, angle, deg=True, return_inten = True):
+    def get_dis(self, data, angle, deg=True, return_inten=True):
         if deg:
             angle = np.deg2rad(angle)
         dis = 0
         intensities = None
-        # ROS 2 中 angle_min 等属性用法一致
         temp = int((angle - data.angle_min) / data.angle_increment)
 
-        # 增加边界检查防止仿真器数据越界崩溃
-        start_idx = max(0, temp-2)
-        end_idx = min(len(data.ranges), temp+2)
-        
+        start_idx = max(0, temp - 2)
+        end_idx = min(len(data.ranges), temp + 2)
+
         data_tmp = data.ranges[start_idx:end_idx]
-        inten_tmp = data.intensities[start_idx:end_idx] if len(data.intensities) > 0 else [0]*len(data_tmp)
-        
-        # 必须转为 numpy 才能 sort
+        inten_tmp = data.intensities[start_idx:end_idx] if len(data.intensities) > 0 else [0] * len(data_tmp)
+
         data_tmp = np.sort(np.array(data_tmp))
         inten_tmp = np.sort(np.array(inten_tmp))
 
-        # 保持原逻辑：取第2个元素（中位数/3rd）
         if len(data_tmp) > 2:
             dis = data_tmp[2]
             intensities = inten_tmp[2]
         elif len(data_tmp) > 0:
             dis = data_tmp[0]
             intensities = inten_tmp[0]
-            
-        if return_inten:
-            return dis,intensities
-        else:
-            return dis
 
-    # 严格保留原逻辑的循环调用方式
-    def get_range(self, data, start_angle, end_engle, return_inten = False):
+        if return_inten:
+            return dis, intensities
+        return dis
+
+    def get_range(self, data, start_angle, end_engle, return_inten=False):
         all_dis = []
         all_inten = []
-        for angle in range(start_angle,end_engle):
-            tmp = self.get_dis(data, angle, return_inten = return_inten)
+        for angle in range(start_angle, end_engle):
+            tmp = self.get_dis(data, angle, return_inten=return_inten)
             all_dis.append(tmp[0])
             all_inten.append(tmp[1])
         if return_inten:
-            return all_dis,all_inten
-        else:
-            return all_dis
+            return all_dis, all_inten
+        return all_dis
 
     def fill_zeros_with_neighbors(self, data):
-        result = list(data) # 确保复制
+        result = list(data)
         n = len(result)
 
         for i in range(n):
             if result[i] == 0:
-                # Try to use the left neighbor
                 left = next((result[j] for j in range(i - 1, -1, -1) if result[j] != 0), None)
                 if left is not None:
                     result[i] = left
                     continue
 
-                # Otherwise try to use the right neighbor
                 right = next((result[j] for j in range(i + 1, n) if result[j] != 0), None)
                 if right is not None:
                     result[i] = right
                     continue
 
                 result[i] = 0
-                # print("Warning: No non-zero neighbors found for index", i) # 保持注释或打印
-        
         return result
 
     def filter_obstacles_by_variance(self, Left_obs_orig, dis_90, variance_threshold=1.0):
-        Left_obs = []  
+        Left_obs = []
         if len(Left_obs_orig) > 0:
             for i in range(0, int(len(Left_obs_orig) / 2), 1):
                 idx_start = int(Left_obs_orig[2 * i])
                 idx_end = int(Left_obs_orig[2 * i + 1])
-                
-                # dis_obs_middle = dis_90[int((idx_start + idx_end) / 2)]
                 obstacle_range = dis_90[idx_start: idx_end]
                 dis_obs_var = np.var(obstacle_range)
-
-                print("in filter_obstacles_by_variance,方差：",dis_obs_var)
+                print('in filter_obstacles_by_variance,方差：', dis_obs_var)
                 Left_obs.append(idx_start)
                 Left_obs.append(idx_end)
         return Left_obs
@@ -210,14 +320,14 @@ class BattleVehicleNode(Node):
         for i in range(1, len(data) - 1):
             if data[i] != max_distance:
                 if all(data[j] == max_distance for j in range(i - angle_range, i + angle_range + 1) if 0 <= j < len(data)):
-                    data[i] = (data[i-1] + data[i+1]) / 2
+                    data[i] = (data[i - 1] + data[i + 1]) / 2
         return data.tolist()
 
     def filter_small_obstacles(self, Left_obs, min_obstacle_size=2):
         for i in range(int(len(Left_obs) / 2)):
             if abs(Left_obs[2 * i] - Left_obs[2 * i + 1]) <= min_obstacle_size:
-                Left_obs[2 * i] = -1  
-                Left_obs[2 * i + 1] = -1  
+                Left_obs[2 * i] = -1
+                Left_obs[2 * i + 1] = -1
         Left_obs_temp = Left_obs
         Left_obs = [x for x in Left_obs_temp if x != -1]
         return Left_obs
@@ -225,259 +335,233 @@ class BattleVehicleNode(Node):
     def pub_scan(self, dis_90, header):
         scan_msg = LaserScan()
         scan_msg.header = header
-        scan_msg.angle_min =  np.pi / 2  # 90 degrees
-        scan_msg.angle_max = -np.pi / 2    # 90 degrees
-        scan_msg.angle_increment =  -np.pi/180  # 1 degree in radians
-        scan_msg.ranges = [float(x) for x in dis_90] # 确保是float list
-        scan_msg.intensities = [] 
+        scan_msg.angle_min = np.pi / 2
+        scan_msg.angle_max = -np.pi / 2
+        scan_msg.angle_increment = -np.pi / 180
+        scan_msg.ranges = [float(x) for x in dis_90]
+        scan_msg.intensities = []
         scan_msg.range_max = 100.0
         self.scan_pub.publish(scan_msg)
 
-    def DynamicObastcle(self, dis_list,inten_list, max_dir_num, obs):
-        if len(max_dir_num) < 3: return False # 防止索引越界
+    def DynamicObastcle(self, dis_list, inten_list, max_dir_num, obs):
+        if len(max_dir_num) < 3:
+            return False
         max_range = [max_dir_num[0], max_dir_num[-1]]
         obs_range = [max_dir_num[1], max_dir_num[2]]
-        
+
         range_list = inten_list[max_range[0]:max_range[1]]
         obs_intensity = inten_list[obs_range[0]:obs_range[1]]
-        
-        # 增加空数组检查
-        if len(range_list) == 0 or len(obs_intensity) == 0: return False
+
+        if len(range_list) == 0 or len(obs_intensity) == 0:
+            return False
 
         average_obs_intensity = np.mean(obs_intensity)
         average_intensity = np.mean(range_list)
         abs_tmp = abs(average_obs_intensity - average_intensity)
         if abs_tmp > 5:
-            print('detect dynamic obs abs_tmpabs_tmpabs_tmpabs_tmp!!!!',abs_tmp)
+            print('detect dynamic obs abs_tmpabs_tmpabs_tmpabs_tmp!!!!', abs_tmp)
             return True
-        else:
-            return False 
+        return False
 
-    # === 核心回调逻辑（完全保持原流程） ===
-    def middle_line_callback(self, data):
-        # 仿真器兼容性补丁：将 inf 转为 0，因为你的算法(fill_zeros)是专门处理0的
-        # 如果不加这行，get_dis 拿到的都是 inf，算法会认为没有数据
-        clean_ranges = np.nan_to_num(np.array(data.ranges), posinf=0.0, neginf=0.0)
-        data.ranges = clean_ranges.tolist()
-
-        # 【新增】动态获取当前雷达的 Frame ID，不再硬编码 ego_racecar
-        current_frame = data.header.frame_id if data.header.frame_id else "laser"
-
-        # 初始化本轮变量
+    def frontend_scan_process(self, data):
         self.dynamic_obs = False
         self.chaoche = False
         self.Follow = False
         self.D = 0.2
-        print("###########################################################")
-        
-        # 1. 调用原来的 get_range 获取数据
+        print('###########################################################')
+
         dis_90, inten_90 = self.get_range(data, -89, 91, True)
         dis_90 = dis_90[::-1]
         inten_90 = inten_90[::-1]
         dis_obs_90 = copy.deepcopy(dis_90)
         lenth_dis = len(dis_90)
-        
-        #方向变量
+
         left = 0
         right = 0
         Left_obs_orig = []
         Left_obs = []
         max_dis_num = []
         max_dir_num = []
-        max_dis = 0 
+        max_dis = 0
         max_dir_range = 0
         max_dis_index = 0
         max_dir_index = 0
-        
+
         self.pub_scan(dis_90, data.header)
-        
-        # 2. 滤波流程 (保持不变)
-        dis_90 = self.fill_zeros_with_neighbors(dis_90) 
-        inten_90 = self.fill_zeros_with_neighbors(inten_90) 
-        dis_obs_90 = self.fill_zeros_with_neighbors(dis_obs_90) 
-        
+
+        dis_90 = self.fill_zeros_with_neighbors(dis_90)
+        inten_90 = self.fill_zeros_with_neighbors(inten_90)
+        dis_obs_90 = self.fill_zeros_with_neighbors(dis_obs_90)
+
         dis_90_copy = tuple(dis_90)
-        
-        # 3. 找最大距离 (保持不变)
-        for i in range(0,lenth_dis,1):
-            if dis_90[i]>max_dis and i>20 and i<160:
+
+        for i in range(0, lenth_dis, 1):
+            if dis_90[i] > max_dis and i > 20 and i < 160:
                 max_dis = dis_90[i]
-                max_dis_index = i 
-            if  dis_90[i] > DIR_DETECT_THRESHOLD:
-                dis_90[i] = DIR_DETECT_THRESHOLD 
+                max_dis_index = i
+            if dis_90[i] > DIR_DETECT_THRESHOLD:
+                dis_90[i] = DIR_DETECT_THRESHOLD
             if dis_obs_90[i] > OBS_DETECT_THRESHOLD:
-                dis_obs_90[i] = OBS_DETECT_THRESHOLD 
-                
-        dis_90 = self.filter_anomalous_values(dis_90, max_distance = DIR_DETECT_THRESHOLD, angle_range=2)
-        dis_obs_90 = self.filter_anomalous_values(dis_obs_90, max_distance = OBS_DETECT_THRESHOLD, angle_range=2)
+                dis_obs_90[i] = OBS_DETECT_THRESHOLD
+
+        dis_90 = self.filter_anomalous_values(dis_90, max_distance=DIR_DETECT_THRESHOLD, angle_range=2)
+        dis_obs_90 = self.filter_anomalous_values(dis_obs_90, max_distance=OBS_DETECT_THRESHOLD, angle_range=2)
 
         if max_dis_index < 89:
             left = 1
         else:
             right = 1
 
-        # 4. 障碍物提取 (保持不变)
-        for i in range(len(dis_90)):
-            if dis_90[i]==0:
-                pass # print("zero is ???????",i)
-
-        for i in range(0,lenth_dis-2,1):
-            if dis_obs_90[i]-dis_obs_90[i+1] > THRESHOLD_obs and len(Left_obs_orig)%2 ==0:
-                Left_obs_orig.append(i+1)
-            elif dis_obs_90[i+1]-dis_obs_90[i] > THRESHOLD_obs and len(Left_obs_orig)%2 ==1:
+        for i in range(0, lenth_dis - 2, 1):
+            if dis_obs_90[i] - dis_obs_90[i + 1] > THRESHOLD_obs and len(Left_obs_orig) % 2 == 0:
+                Left_obs_orig.append(i + 1)
+            elif dis_obs_90[i + 1] - dis_obs_90[i] > THRESHOLD_obs and len(Left_obs_orig) % 2 == 1:
                 Left_obs_orig.append(i)
-        
-        if len(Left_obs_orig)%2 == 1:
+
+        if len(Left_obs_orig) % 2 == 1:
             print('error!!!!!!!!!!!!')
             Left_obs_orig.pop()
-        
-        left_obs_copy = copy.deepcopy(Left_obs_orig)
-        Left_obs = self.filter_small_obstacles(Left_obs_orig,min_obstacle_size = 2)
+
+        Left_obs = self.filter_small_obstacles(Left_obs_orig, min_obstacle_size=2)
         Left_obs = self.filter_obstacles_by_variance(Left_obs, dis_obs_90, variance_threshold=1.0)
-        
-        # 5. 障碍膨胀 (保持不变)
-        if len(Left_obs)>0 :
-            for i in range(0,int(len(Left_obs)/2),1):
-                idx_mid = int((Left_obs[2*i]+Left_obs[2*i+1])/2)
+
+        if len(Left_obs) > 0:
+            for i in range(0, int(len(Left_obs) / 2), 1):
+                idx_mid = int((Left_obs[2 * i] + Left_obs[2 * i + 1]) / 2)
                 obs_middle = dis_obs_90[idx_mid]
-                
-                start_expand = int(max(Left_obs[2*i]-min((Left_obs[2*i+1]-Left_obs[2*i])/2*(4-obs_middle),10),0))
-                end_expand = int(min(Left_obs[2*i+1]+min((Left_obs[2*i+1]-Left_obs[2*i])/2*(4-obs_middle),10),lenth_dis-1))
+
+                start_expand = int(max(Left_obs[2 * i] - min((Left_obs[2 * i + 1] - Left_obs[2 * i]) / 2 * (4 - obs_middle), 10), 0))
+                end_expand = int(min(Left_obs[2 * i + 1] + min((Left_obs[2 * i + 1] - Left_obs[2 * i]) / 2 * (4 - obs_middle), 10), lenth_dis - 1))
 
                 for j in range(start_expand, end_expand, 1):
                     dis_obs_90[j] = obs_middle
-                
-                Left_obs[2*i]=start_expand
-                Left_obs[2*i+1]=end_expand
-            print("有障碍物，障碍物是",Left_obs)
-        else:
-            print("没有障碍物")
 
-        # 6. 计算可行区域 (保持不变)
-        if len(Left_obs)>0 :
-            for i in range(0,int(len(Left_obs)/2)+1,1):
+                Left_obs[2 * i] = start_expand
+                Left_obs[2 * i + 1] = end_expand
+            print('有障碍物，障碍物是', Left_obs)
+        else:
+            print('没有障碍物')
+
+        if len(Left_obs) > 0:
+            for i in range(0, int(len(Left_obs) / 2) + 1, 1):
                 if i == 0:
-                    for j in range(Left_obs[0]-1,0,-1):
-                        if dis_obs_90[j]<=dis_obs_90[Left_obs[0]+1]:
+                    for j in range(Left_obs[0] - 1, 0, -1):
+                        if dis_obs_90[j] <= dis_obs_90[Left_obs[0] + 1]:
                             max_dis_num.append(j)
-                            max_dis_num.append(Left_obs[0]+1)
+                            max_dis_num.append(Left_obs[0] + 1)
                             break
-                    if len(max_dis_num)==0:
-                        for j in range(0,Left_obs[0]-1,1):
-                            if dis_obs_90[j]>=dis_obs_90[Left_obs[0]+1]:
+                    if len(max_dis_num) == 0:
+                        for j in range(0, Left_obs[0] - 1, 1):
+                            if dis_obs_90[j] >= dis_obs_90[Left_obs[0] + 1]:
                                 max_dis_num.append(j)
-                                max_dis_num.append(Left_obs[0]+1)
+                                max_dis_num.append(Left_obs[0] + 1)
                                 break
-                elif i < int(len(Left_obs)/2):
-                    max_dis_num.append(Left_obs[2*i-1])
-                    max_dis_num.append(Left_obs[2*i])
-                elif i == int(len(Left_obs)/2):
-                    for j in range(Left_obs[2*i-1]+1,lenth_dis-1,1):
-                        if dis_obs_90[j]<=dis_obs_90[Left_obs[2*i-1]-1]:
-                            max_dis_num.append(Left_obs[2*i-1]-1)
+                elif i < int(len(Left_obs) / 2):
+                    max_dis_num.append(Left_obs[2 * i - 1])
+                    max_dis_num.append(Left_obs[2 * i])
+                elif i == int(len(Left_obs) / 2):
+                    for j in range(Left_obs[2 * i - 1] + 1, lenth_dis - 1, 1):
+                        if dis_obs_90[j] <= dis_obs_90[Left_obs[2 * i - 1] - 1]:
+                            max_dis_num.append(Left_obs[2 * i - 1] - 1)
                             max_dis_num.append(j)
                             break
 
             max_dis_val = 0
             max_dis_index_temp = max_dis_index
-            
-            for i in range(0,int(len(max_dis_num)/2),1):
-                if max_dis_val < max_dis_num[2*i+1] - max_dis_num[2*i] :
-                    max_dis_val = max_dis_num[2*i+1] - max_dis_num[2*i]
-                    max_dis_index = (max_dis_num[2*i+1] + max_dis_num[2*i])/2
-                if left == 1 and max_dis_index < 90 and dis_obs_90[0]<dis_obs_90[lenth_dis-1]-1:
-                    max_dis_index = max_dis_index+5*abs(dis_obs_90[lenth_dis-1]-dis_obs_90[0])
-                elif right == 1 and max_dis_index > 90 and dis_obs_90[0]-1>dis_obs_90[lenth_dis-1]:
-                    max_dis_index = max_dis_index-5*abs(dis_obs_90[lenth_dis-1]-dis_obs_90[0])
 
-            print("max_dis_index_temp",max_dis_index_temp)
-            if len(Left_obs) ==2 :
-                if max_dis_index_temp >=89:
-                    print("turn right")
-                    if Left_obs[0] >=89:
-                        max_dis_index = int((89+Left_obs[0])/2)
-                    elif Left_obs[1] <=89:
+            for i in range(0, int(len(max_dis_num) / 2), 1):
+                if max_dis_val < max_dis_num[2 * i + 1] - max_dis_num[2 * i]:
+                    max_dis_val = max_dis_num[2 * i + 1] - max_dis_num[2 * i]
+                    max_dis_index = (max_dis_num[2 * i + 1] + max_dis_num[2 * i]) / 2
+                if left == 1 and max_dis_index < 90 and dis_obs_90[0] < dis_obs_90[lenth_dis - 1] - 1:
+                    max_dis_index = max_dis_index + 5 * abs(dis_obs_90[lenth_dis - 1] - dis_obs_90[0])
+                elif right == 1 and max_dis_index > 90 and dis_obs_90[0] - 1 > dis_obs_90[lenth_dis - 1]:
+                    max_dis_index = max_dis_index - 5 * abs(dis_obs_90[lenth_dis - 1] - dis_obs_90[0])
+
+            print('max_dis_index_temp', max_dis_index_temp)
+            if len(Left_obs) == 2:
+                if max_dis_index_temp >= 89:
+                    print('turn right')
+                    if Left_obs[0] >= 89:
+                        max_dis_index = int((89 + Left_obs[0]) / 2)
+                    elif Left_obs[1] <= 89:
                         max_dis_index = max_dis_index_temp
                     else:
                         max_dis_index = max_dis_index_temp
                 else:
-                    if Left_obs[0] >=89:
-                        print("1")
-                        max_dis_index = max_dis_index_temp
-                    elif Left_obs[1] <=89:
-                        print("2")
-                        max_dis_index = int((89+Left_obs[1])/2)
-                    else:
-                        print("3")
-                        max_dis_index = max_dis_index_temp
-            if len(Left_obs) ==4:
-                middle_temp = int((Left_obs[1]+Left_obs[2])/2)
-                if max_dis_index_temp >=89:
                     if Left_obs[0] >= 89:
-                        max_dis_index = int((89+Left_obs[0])/2)
-                    elif Left_obs[1] <= 89 and middle_temp >89:
-                        max_dis_index = int((Left_obs[1]+max_dis_index_temp)/2)
-                    elif middle_temp <= 89 and Left_obs[2] >89:
+                        print('1')
+                        max_dis_index = max_dis_index_temp
+                    elif Left_obs[1] <= 89:
+                        print('2')
+                        max_dis_index = int((89 + Left_obs[1]) / 2)
+                    else:
+                        print('3')
+                        max_dis_index = max_dis_index_temp
+            if len(Left_obs) == 4:
+                middle_temp = int((Left_obs[1] + Left_obs[2]) / 2)
+                if max_dis_index_temp >= 89:
+                    if Left_obs[0] >= 89:
+                        max_dis_index = int((89 + Left_obs[0]) / 2)
+                    elif Left_obs[1] <= 89 and middle_temp > 89:
+                        max_dis_index = int((Left_obs[1] + max_dis_index_temp) / 2)
+                    elif middle_temp <= 89 and Left_obs[2] > 89:
                         max_dis_index = middle_temp
                     else:
                         max_dis_index = max_dis_index_temp
                 else:
-                    print("turn left")
+                    print('turn left')
                     if Left_obs[0] > 89:
                         max_dis_index = max_dis_index_temp
-                    elif Left_obs[0] <= 89 and middle_temp >89:
+                    elif Left_obs[0] <= 89 and middle_temp > 89:
                         max_dis_index = middle_temp
-                    elif middle_temp <= 89 and Left_obs[3] >89:
+                    elif middle_temp <= 89 and Left_obs[3] > 89:
                         max_dis_index = middle_temp
                     else:
-                        max_dis_index = int((Left_obs[3] + 89)/2)
+                        max_dis_index = int((Left_obs[3] + 89) / 2)
 
-        # 7. 寻找最大距离区域 (保持不变)
-        for i in range(0,lenth_dis-2,1):
-            if dis_90[i]<DIR_DETECT_THRESHOLD and dis_90[i+1] == DIR_DETECT_THRESHOLD and len(max_dir_num)%2==0:
-                max_dir_num.append(i+1)
-            elif dis_90[i]==DIR_DETECT_THRESHOLD and dis_90[i+1] < DIR_DETECT_THRESHOLD and len(max_dir_num)%2==1:
+        for i in range(0, lenth_dis - 2, 1):
+            if dis_90[i] < DIR_DETECT_THRESHOLD and dis_90[i + 1] == DIR_DETECT_THRESHOLD and len(max_dir_num) % 2 == 0:
+                max_dir_num.append(i + 1)
+            elif dis_90[i] == DIR_DETECT_THRESHOLD and dis_90[i + 1] < DIR_DETECT_THRESHOLD and len(max_dir_num) % 2 == 1:
                 max_dir_num.append(i)
 
-        if len(max_dir_num) % 2 == 1 and len(max_dir_num)!= 1:
-            self.get_logger().error("出现单个不封闭区域，请检查障碍物检测逻辑")
-            for i in range(0,lenth_dis-2,1):
-                pass 
-    
-        # 转弯阶段
-        if len(max_dir_num) == 1:
-            if max_dir_num[0] < 90:     
-                max_dir_index = int((max_dir_num[0])/2)
-                print("\033[32m转弯阶段1左转，最大距离朝向: %s\033[0m" % (max_dir_index - lenth_dis/2))
-            elif max_dir_num[0] > 90:
-                max_dir_index = int((max_dir_num[0]+lenth_dis-2)/2)
-                print("\033[32m转弯阶段1右转，最大距离朝向: %s\033[0m" % (max_dir_index - lenth_dis/2))
-            self.GO_STARIGHT = 0
-        
-        if len(max_dir_num)==2:
-            print("找到 %d 个最大距离区域，区域大小 %d" % ((int(len(max_dir_num)/2)), max_dir_num[1]-max_dir_num[0]))
-            max_dir_index = int((max_dir_num[0]+max_dir_num[1])/2)
-            max_dir_range = max_dir_num[1]-max_dir_num[0]
+        if len(max_dir_num) % 2 == 1 and len(max_dir_num) != 1:
+            self.get_logger().error('出现单个不封闭区域，请检查障碍物检测逻辑')
 
-        if len(max_dir_num)>2:
-            print("有多个最大距离区域，障碍物个数为:",len(Left_obs)/2)
+        if len(max_dir_num) == 1:
+            if max_dir_num[0] < 90:
+                max_dir_index = int((max_dir_num[0]) / 2)
+                print('\033[32m转弯阶段1左转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
+            elif max_dir_num[0] > 90:
+                max_dir_index = int((max_dir_num[0] + lenth_dis - 2) / 2)
+                print('\033[32m转弯阶段1右转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
+            self.GO_STARIGHT = 0
+
+        if len(max_dir_num) == 2:
+            print('找到 %d 个最大距离区域，区域大小 %d' % ((int(len(max_dir_num) / 2)), max_dir_num[1] - max_dir_num[0]))
+            max_dir_index = int((max_dir_num[0] + max_dir_num[1]) / 2)
+            max_dir_range = max_dir_num[1] - max_dir_num[0]
+
+        if len(max_dir_num) > 2:
+            print('有多个最大距离区域，障碍物个数为:', len(Left_obs) / 2)
 
             if len(Left_obs) > 0:
-                self.dynamic_obs = self.DynamicObastcle(dis_list=dis_90,inten_list = inten_90, max_dir_num = max_dir_num, obs = Left_obs)
-            
-            cand_space = [] 
-            cand_dirs = [] 
-            for i in range(0,int(len(max_dir_num)/2),1):
-                cand_space.append(max_dir_num[2*(i)+1]-max_dir_num[2*(i)])
-                cand_dirs.append((max_dir_num[2*(i)+1]+max_dir_num[2*(i)])/2)
-            cand_dir_id = np.where(np.array(cand_space)>18)[0] 
-            if len(cand_dir_id)!=0:
+                self.dynamic_obs = self.DynamicObastcle(dis_list=dis_90, inten_list=inten_90, max_dir_num=max_dir_num, obs=Left_obs)
+
+            cand_space = []
+            cand_dirs = []
+            for i in range(0, int(len(max_dir_num) / 2), 1):
+                cand_space.append(max_dir_num[2 * (i) + 1] - max_dir_num[2 * (i)])
+                cand_dirs.append((max_dir_num[2 * (i) + 1] + max_dir_num[2 * (i)]) / 2)
+            cand_dir_id = np.where(np.array(cand_space) > 18)[0]
+            if len(cand_dir_id) != 0:
                 selected_dirs = np.array(cand_dirs)[cand_dir_id].tolist()
                 max_dir_idx = np.argmin(selected_dirs)
                 selected_ranges = np.array(cand_space)[cand_dir_id].tolist()
                 max_dir_index = selected_dirs[max_dir_idx]
                 max_dir_range = selected_ranges[max_dir_idx]
-                cand_dir_chaoche_idx = np.where(np.array(cand_space)>30)[0]
+                cand_dir_chaoche_idx = np.where(np.array(cand_space) > 30)[0]
                 if self.dynamic_obs:
                     if cand_dir_chaoche_idx.size:
                         self.chaoche = True
@@ -498,14 +582,14 @@ class BattleVehicleNode(Node):
             else:
                 max_dir_index += 2
 
-        print(max_dir_num,self.P)
+        print(max_dir_num, self.P)
         if max_dir_index >= 75 and max_dir_index <= 105:
             mean_straight = np.mean(dis_90_copy[80:100])
             self.GO_STARIGHT = 1
-            self.TRANSITION = 0      
+            self.TRANSITION = 0
             if self.last_in_straight and max_dir_range > 20:
-                print("在直道路段保持加速，最大距离朝向:", (max_dir_index - len(dis_90) / 2)," 加速空间范围：",max_dir_range)  
-                self.speed_rate *= 1.05   
+                print('在直道路段保持加速，最大距离朝向:', (max_dir_index - len(dis_90) / 2), ' 加速空间范围：', max_dir_range)
+                self.speed_rate *= 1.05
                 if mean_straight > 11 and len(Left_obs) == 0:
                     limit_rate = 1.8
                 elif mean_straight > 8 and len(Left_obs) == 0:
@@ -516,57 +600,56 @@ class BattleVehicleNode(Node):
                     limit_rate = 1.0
                 if self.speed_rate > limit_rate:
                     self.speed_rate = limit_rate
-                
+
                 print('速度增益', self.speed_rate)
             else:
-                self.speed_rate = 1.1    
-                
-            self.last_in_straight = True    
+                self.speed_rate = 1.1
+
+            self.last_in_straight = True
         elif max_dir_index < 75 and max_dir_index > 0:
-            print("\033[32m转弯阶段2左转，最大距离朝向: %s\033[0m" % (max_dir_index - lenth_dis/2))
+            print('\033[32m转弯阶段2左转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             self.P = 1.5
             self.speed_rate = 1.0
             self.turn_rate = 0.8
             self.last_in_straight = False
         elif max_dir_index > 105:
-            print("\033[32m转弯阶段2右转，最大距离朝向: %s\033[0m" % (max_dir_index - lenth_dis/2))
+            print('\033[32m转弯阶段2右转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             self.P = 1.5
             self.speed_rate = 1.0
             self.turn_rate = 0.8
             self.last_in_straight = False
-        
-        #过渡路段或转弯路段
+
         normol = 1
         if len(max_dir_num) == 0:
             if self.GO_STARIGHT == 1 or self.TRANSITION == 1:
-                for i in range(0,lenth_dis-2,1):
-                    if dis_90[i+1] - dis_90[i] > THRESHOLD_TURN:
-                        max_dir_index = int((i+1+len(dis_90)/2)/2)
-                        self.get_logger().warn("进入过渡路段，前方左转，最大距离朝向: %f" % (max_dir_index-len(dis_90)/2))
+                for i in range(0, lenth_dis - 2, 1):
+                    if dis_90[i + 1] - dis_90[i] > THRESHOLD_TURN:
+                        max_dir_index = int((i + 1 + len(dis_90) / 2) / 2)
+                        self.get_logger().warn('进入过渡路段，前方左转，最大距离朝向: %f' % (max_dir_index - len(dis_90) / 2))
                         self.P = 0.8
                         normol = 0
-                    elif dis_90[i] - dis_90[i+1] > THRESHOLD_TURN:
-                        max_dir_index = int((i+len(dis_90)/2)/2)
-                        self.get_logger().warn("进入过渡路段，前方右转，最大距离朝向: %f" % (max_dir_index-len(dis_90)/2))
+                    elif dis_90[i] - dis_90[i + 1] > THRESHOLD_TURN:
+                        max_dir_index = int((i + len(dis_90) / 2) / 2)
+                        self.get_logger().warn('进入过渡路段，前方右转，最大距离朝向: %f' % (max_dir_index - len(dis_90) / 2))
                         self.P = 0.8
                         normol = 0
                 if normol == 1:
                     max_dir_index = self.last_max_dir_index
-                    print("\033[38;5;208m隐藏款，无法判断方向，保持上一次动作并减速，最大距离朝向: %f\033[0m" % (max_dir_index-len(dis_90)/2))
-                    
+                    print('\033[38;5;208m隐藏款，无法判断方向，保持上一次动作并减速，最大距离朝向: %f\033[0m' % (max_dir_index - len(dis_90) / 2))
+
                     if self.last_in_normol:
-                        self.speed_rate *= 0.9         
+                        self.speed_rate *= 0.9
                         self.turn_rate *= 1.2
                         if self.speed_rate < 0.5:
                             self.speed_rate = 0.5
                         if self.turn_rate > 2.5:
                             self.turn_rate = 2.5
                     else:
-                        self.speed_rate = 0.9          
+                        self.speed_rate = 0.9
                         self.turn_rate = 1.2
                     self.last_in_normol = True
                 else:
-                    self.speed_rate = 1.0              
+                    self.speed_rate = 1.0
                     self.turn_rate = 1.0
                     self.last_in_normol = False
 
@@ -574,69 +657,268 @@ class BattleVehicleNode(Node):
                 self.GO_STARIGHT = 0
 
         dis_90[0] = dis_90[0] + 0.00001
-        print("视野中最大距离是",max_dis)
-        dis_90[lenth_dis-1] = dis_90[lenth_dis-1] +0.00001
-        
-        angle = 0
+        dis_90[lenth_dis - 1] = dis_90[lenth_dis - 1] + 0.00001
+
+        return {
+            'dis_90': dis_90,
+            'lenth_dis': lenth_dis,
+            'max_dis': max_dis,
+            'max_dir_index': max_dir_index,
+            'max_dir_num': max_dir_num,
+            'left_obs': Left_obs,
+            'header': data.header,
+        }
+
+    def heuristic_backend_control(self, front_state):
+        dis_90 = front_state['dis_90']
+        lenth_dis = front_state['lenth_dis']
+        max_dis = front_state['max_dis']
+        max_dir_index = front_state['max_dir_index']
+
+        print('视野中最大距离是', max_dis)
+
+        angle = 0.0
         if max_dir_index != 0:
-            term1 = -max(math.exp(-max_dis/DIR_DETECT_THRESHOLD),0.7)*(max_dir_index-90)/360 *math.pi
-            term2 = (dis_90[0]-dis_90[lenth_dis-1])/(dis_90[0]+dis_90[lenth_dis-1])
+            term1 = -max(math.exp(-max_dis / DIR_DETECT_THRESHOLD), 0.7) * (max_dir_index - 90) / 360 * math.pi
+            term2 = (dis_90[0] - dis_90[lenth_dis - 1]) / (dis_90[0] + dis_90[lenth_dis - 1])
             print(f'term1:{term1}, term2:{term2}')
-            if dis_90[0]/dis_90[lenth_dis-1]>3 or dis_90[lenth_dis-1]/dis_90[0]>3:
+            if dis_90[0] / dis_90[lenth_dis - 1] > 3 or dis_90[lenth_dis - 1] / dis_90[0] > 3:
                 self.D = 0.5
-                print(f'边界！！！！！！！！！！！！！！！！')
+                print('边界！！！！！！！！！！！！！！！！')
                 angle = 1.0 * term1 + 0.05 * term2
             else:
                 angle = 1.0 * term1 + 0.02 * term2
-
         else:
-            if dis_90[0]/dis_90[lenth_dis-1]>3 or dis_90[lenth_dis-1]/dis_90[0]>3: 
-                angle = -max(math.exp(-max_dis/DIR_DETECT_THRESHOLD),0.7)*(max_dir_index-90)/360 *math.pi + 0.1*(dis_90[0]-dis_90[lenth_dis-1])/(dis_90[0]+dis_90[lenth_dis-1])
+            if dis_90[0] / dis_90[lenth_dis - 1] > 3 or dis_90[lenth_dis - 1] / dis_90[0] > 3:
+                angle = -max(math.exp(-max_dis / DIR_DETECT_THRESHOLD), 0.7) * (max_dir_index - 90) / 360 * math.pi + 0.1 * (dis_90[0] - dis_90[lenth_dis - 1]) / (dis_90[0] + dis_90[lenth_dis - 1])
             else:
-                angle = -max(math.exp(-max_dis/DIR_DETECT_THRESHOLD),0.7)*(max_dir_index-90)/360 *math.pi + 0.05*(dis_90[0]-dis_90[lenth_dis-1])/(dis_90[0]+dis_90[lenth_dis-1]) 
+                angle = -max(math.exp(-max_dis / DIR_DETECT_THRESHOLD), 0.7) * (max_dir_index - 90) / 360 * math.pi + 0.05 * (dis_90[0] - dis_90[lenth_dis - 1]) / (dis_90[0] + dis_90[lenth_dis - 1])
 
-        steering_angle = self.P* angle + self.D *(angle-self.last_angle)
+        steering_angle = self.P * angle + self.D * (angle - self.last_angle)
         self.last_angle = angle
 
-        speed = 1.8*(0.3*math.exp(-np.clip(abs(angle),0,0.5))+0.7)
-        
-        print("max_dir_index",max_dir_index)
-    
-        steering_angle = self.turn_rate*steering_angle
-        steering_angle = np.clip(steering_angle, -math.pi/4, math.pi/4)  
-        if steering_angle > 0:    
-            print("转向左转%f度"%(abs(steering_angle*180/math.pi)))
-        else:
-            print("转向右转%f度"%(abs(steering_angle*180/math.pi)))
-        
-        # 【修改】传入当前帧 Frame ID
-        self.publish_arrow_marker(max_dir_index, current_frame)
-        self.last_max_dir_index = max_dir_index
-    
+        speed = 1.8 * (0.3 * math.exp(-np.clip(abs(angle), 0, 0.5)) + 0.7)
+
+        steering_angle = self.turn_rate * steering_angle
+        steering_angle = np.clip(steering_angle, -math.pi / 4, math.pi / 4)
+
+        return {
+            'angle': angle,
+            'steering': float(steering_angle),
+            'speed': float(self.speed_rate * speed),
+            'base_speed': float(speed),
+        }
+
+    def build_local_ref(self, front_state, target_speed, speed_upper_bound):
+        # 局部参考点定义在 base_link: x前向, y左向。
+        # speed_upper_bound 是本帧可用最高速度（由Follow/chaoche/全局上限共同决定）。
+        target_heading = (float(front_state['max_dir_index']) - 90.0) / 180.0 * math.pi
+        target_heading = float(np.clip(target_heading, -0.9, 0.9))
+
+        x_ref = np.zeros(self.mpc_horizon)
+        y_ref = np.zeros(self.mpc_horizon)
+        yaw_ref = np.zeros(self.mpc_horizon)
+        v_ref = np.zeros(self.mpc_horizon)
+
+        v_des = float(np.clip(target_speed, max(self.mpc_min_speed, 0.0), speed_upper_bound))
+        for k in range(self.mpc_horizon):
+            s = (k + 1) * self.mpc_dt * max(v_des, 0.3)
+            x_ref[k] = s * math.cos(target_heading)
+            y_ref[k] = s * math.sin(target_heading)
+            yaw_ref[k] = target_heading
+            v_ref[k] = v_des
+
+        return {
+            'x': x_ref,
+            'y': y_ref,
+            'yaw': yaw_ref,
+            'v': v_ref,
+        }
+
+    def rollout_cost(self, steer, accel, state, ref, speed_upper_bound):
+        x = 0.0
+        y = 0.0
+        yaw = 0.0
+        v = float(state['v'])
+
+        cost = 0.0
+        for k in range(self.mpc_horizon):
+            x += v * math.cos(yaw) * self.mpc_dt
+            y += v * math.sin(yaw) * self.mpc_dt
+            yaw += v / self.wheelbase * math.tan(steer) * self.mpc_dt
+            v = np.clip(v + accel * self.mpc_dt, self.mpc_min_speed, speed_upper_bound)
+
+            ex = x - ref['x'][k]
+            ey = y - ref['y'][k]
+            eyaw = (yaw - ref['yaw'][k] + math.pi) % (2 * math.pi) - math.pi
+            ev = v - ref['v'][k]
+
+            cost += 2.0 * ex * ex + 3.0 * ey * ey + 0.8 * eyaw * eyaw + 0.3 * ev * ev
+            cost += 0.05 * steer * steer + 0.02 * accel * accel
+            cost += 0.12 * (steer - self.last_mpc_steer) * (steer - self.last_mpc_steer)
+
+        return float(cost), float(v)
+
+    def solve_mpc(self, front_state, heuristic, speed_upper_bound):
+        if not self.have_odom:
+            return False, heuristic['steering'], heuristic['speed'], 'no_odom', 0.0
+
+        ref = self.build_local_ref(front_state, heuristic['speed'], speed_upper_bound)
+        start_t = time.monotonic()
+        timeout_s = self.mpc_timeout_ms / 1000.0
+
+        steer_grid = np.linspace(-math.pi / 4, math.pi / 4, self.mpc_steer_candidates)
+        accel_grid = [0.0]
+        if self.mpc_mode == 'full':
+            accel_grid = np.linspace(self.mpc_max_decel, self.mpc_max_accel, self.mpc_accel_candidates)
+
+        state = {'v': float(abs(self.odom_speed))}
+
+        best_cost = float('inf')
+        best_steer = heuristic['steering']
+        best_speed = heuristic['speed']
+
+        for steer in steer_grid:
+            for accel in accel_grid:
+                if time.monotonic() - start_t > timeout_s:
+                    elapsed_ms = (time.monotonic() - start_t) * 1000.0
+                    return False, heuristic['steering'], heuristic['speed'], 'timeout', elapsed_ms
+                cost, vend = self.rollout_cost(steer=float(steer), accel=float(accel), state=state, ref=ref, speed_upper_bound=speed_upper_bound)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_steer = float(steer)
+                    if self.mpc_mode == 'full':
+                        best_speed = float(np.clip(vend, self.mpc_min_speed, speed_upper_bound))
+
+        self.last_mpc_steer = best_steer
+        self.last_mpc_speed = best_speed
+        elapsed_ms = (time.monotonic() - start_t) * 1000.0
+        return True, best_steer, best_speed, 'ok', elapsed_ms
+
+    def fallback_guard(self, mpc_ok, heuristic):
+        if mpc_ok:
+            return False, ''
+        return True, 'fallback_heuristic'
+
+    def control_select_and_publish(self, data, current_frame, front_state, heuristic):
         drive_msg = AckermannDriveStamped()
-        drive_msg.header = data.header # 保持同步
-        drive_msg.drive.steering_angle = float(steering_angle)
-        drive_msg.drive.speed= float(self.speed_rate*speed)
-        
+        drive_msg.header = data.header
+
+        heuristic_msg = AckermannDriveStamped()
+        heuristic_msg.header = data.header
+        heuristic_msg.drive.steering_angle = float(heuristic['steering'])
+        heuristic_msg.drive.speed = float(heuristic['speed'])
+
+        mode = CONTROL_MODE_HEURISTIC
+        mpc_ok = False
+        steer_cmd = heuristic['steering']
+        speed_cmd = heuristic['speed']
+        mpc_reason = 'disabled'
+        mpc_solve_ms = 0.0
+
+        # Phase 3统计: 每帧控制循环计数。
+        self.control_cycle_count += 1
+
+        # Phase 2: 先计算本帧速度上界，再传给MPC，确保full模式输出天然满足业务速度边界。
+        speed_upper_bound = self.mpc_max_speed
+        if self.Follow:
+            speed_upper_bound = min(speed_upper_bound, self.follow_speed_cap)
+        elif self.chaoche:
+            speed_upper_bound = min(speed_upper_bound, self.chaoche_speed_cap)
+        speed_upper_bound = float(min(speed_upper_bound, self.final_speed_cap))
+        self.current_speed_upper_bound = speed_upper_bound
+
+        if self.mpc_enable and self.mpc_mode in ('steer_only', 'full'):
+            self.mpc_attempt_count += 1
+            mpc_ok, mpc_steer, mpc_speed, mpc_reason, mpc_solve_ms = self.solve_mpc(front_state, heuristic, speed_upper_bound)
+            if mpc_ok:
+                if self.mpc_mode == 'steer_only':
+                    mode = CONTROL_MODE_MPC_STEER
+                    steer_cmd = mpc_steer
+                else:
+                    mode = CONTROL_MODE_MPC_FULL
+                    steer_cmd = mpc_steer
+                    speed_cmd = mpc_speed
+            else:
+                mode = CONTROL_MODE_FALLBACK
+
+        fallback, _ = self.fallback_guard(mpc_ok or mode == CONTROL_MODE_HEURISTIC, heuristic)
+        if fallback:
+            steer_cmd = heuristic['steering']
+            speed_cmd = heuristic['speed']
+        self.last_mpc_reason = mpc_reason
+        # Phase 3统计: 求解耗时、成功次数、回退次数与模式切换次数。
+        self.last_solve_time_ms = float(mpc_solve_ms)
+        if mpc_ok:
+            self.mpc_success_count += 1
+            self.sum_solve_time_ms += float(mpc_solve_ms)
+            self.max_solve_time_ms = max(self.max_solve_time_ms, float(mpc_solve_ms))
+        if mode == CONTROL_MODE_FALLBACK:
+            self.fallback_trigger_count += 1
+        if mode != self.last_control_mode:
+            self.mode_switch_count += 1
+
+        # 二次保险: 最终输出再次做统一速度边界限幅，防止异常参数造成越界。
+        speed_cmd = float(min(speed_cmd, speed_upper_bound))
+
         if self.Follow:
             print('\033[35m跟随！！22222！！跟随！！2222！！\033[0m')
-            drive_msg.drive.speed = float(min(MIN_OBS_SPEED,self.speed_rate*speed))
+            speed_cmd = float(min(self.follow_speed_cap, speed_cmd))
         elif self.chaoche:
-            drive_msg.drive.speed= float(self.speed_rate*speed)
-            print("""
-            \033[31m   _____                         _____  
-            \033[32m  / ____|                       / ____| 
-            \033[33m | (___  _   _ _ __   ___ _ __  | |  __ 
+            print('''
+            \033[31m   _____                         _____
+            \033[32m  / ____|                       / ____|
+            \033[33m | (___  _   _ _ __   ___ _ __  | |  __
             \033[34m  \___ \| | | | '_ \ / _ \ '__| | | |_ |
             \033[35m  ____) | |_| | |_) |  __/ |    | |__| |
             \033[36m |_____/ \__,_| .__/ \___|_|     \_____|
-            \033[37m              | |                      
+            \033[37m              | |
             \033[35m              |_|   \033[5m超车模式启动！！！\033[0m
-            """)
-            print("speed:",drive_msg.drive.speed)
+            ''')
 
-        
+        drive_msg.drive.steering_angle = float(np.clip(steer_cmd, -math.pi / 4, math.pi / 4))
+        drive_msg.drive.speed = float(np.clip(speed_cmd, 0.0, self.final_speed_cap))
+
+        if drive_msg.drive.steering_angle > 0:
+            print('转向左转%f度' % (abs(drive_msg.drive.steering_angle * 180 / math.pi)))
+        else:
+            print('转向右转%f度' % (abs(drive_msg.drive.steering_angle * 180 / math.pi)))
+
+        self.publish_arrow_marker(front_state['max_dir_index'], current_frame)
+        self.last_max_dir_index = front_state['max_dir_index']
+
+        mpc_msg = AckermannDriveStamped()
+        mpc_msg.header = data.header
+        mpc_msg.drive.steering_angle = float(np.clip(self.last_mpc_steer, -math.pi / 4, math.pi / 4))
+        mpc_msg.drive.speed = float(np.clip(self.last_mpc_speed, 0.0, self.mpc_max_speed))
+
+        self.heuristic_pub.publish(heuristic_msg)
+        self.mpc_pub.publish(mpc_msg)
+
+        mode_msg = UInt8()
+        mode_msg.data = int(mode)
+        self.mode_pub.publish(mode_msg)
+
+        ok_msg = Bool()
+        ok_msg.data = bool(mpc_ok)
+        self.mpc_ok_pub.publish(ok_msg)
+
+        if mode == CONTROL_MODE_FALLBACK and self.mpc_enable:
+            self.get_logger().warn(f'MPC fallback: {mpc_reason}, solve_ms={mpc_solve_ms:.2f}')
+
+        self.last_control_mode = mode
         self.drive_pub.publish(drive_msg)
+
+    def middle_line_callback(self, data):
+        clean_ranges = np.nan_to_num(np.array(data.ranges), posinf=0.0, neginf=0.0)
+        data.ranges = clean_ranges.tolist()
+
+        current_frame = data.header.frame_id if data.header.frame_id else 'laser'
+
+        front_state = self.frontend_scan_process(data)
+        heuristic = self.heuristic_backend_control(front_state)
+        self.control_select_and_publish(data, current_frame, front_state, heuristic)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -648,6 +930,7 @@ def main(args=None):
     finally:
         battle_node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
