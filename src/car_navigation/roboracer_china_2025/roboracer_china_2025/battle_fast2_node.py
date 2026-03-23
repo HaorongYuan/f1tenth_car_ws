@@ -103,11 +103,6 @@ class BattleVehicleNode(Node):
         self.publish_diag_topics = bool(self.get_parameter('publish_diag_topics').value)
 
 
-        self.get_logger().info(
-            f"Battle Node Started. scan={scan_topic}, drive={drive_topic}, odom={odom_topic}, "
-            f"mpc_enable={self.mpc_enable}, mpc_mode={self.mpc_mode}"
-        )
-
         # ---- 反应式前端状态: 保持与原battle_fast2一致，用于方向选择/避障/Follow/chaoche ----
         # === 原逻辑成员变量 ===
         self.last_angle = 0.0
@@ -147,6 +142,13 @@ class BattleVehicleNode(Node):
         self.last_solve_time_ms = 0.0
         self.max_solve_time_ms = 0.0
         self.sum_solve_time_ms = 0.0
+
+        # 日志缓存: 仅用于限流摘要、状态切换打印与MPC失败去重，不参与控制决策。
+        self.current_behavior_state = 'NORMAL'
+        self.last_logged_state = None
+        self.last_logged_controller = None
+        self.last_warned_mpc_fail_reason = None
+        self.last_cmd_speed = 0.0
 
 
         # 激光链路使用BEST_EFFORT，降低高频扫描数据阻塞风险。
@@ -196,11 +198,9 @@ class BattleVehicleNode(Node):
 
     # 预留接口: 接收外部safety节点状态，当前仅缓存用于观测。
 
-    # Phase 3诊断回调: 命令行只打印当前速度和MPC求解耗时。
+    # Phase 3诊断回调: 以固定频率输出统一摘要日志，不在每个控制周期刷屏。
     def diagnostic_timer_callback(self):
-        self.get_logger().info(
-            f"speed={self.odom_speed:.2f}m/s solve={self.last_solve_time_ms:.2f}ms"
-        )
+        self.log_battle_summary()
 
         if self.publish_diag_topics:
             solve_msg = Float32()
@@ -220,8 +220,39 @@ class BattleVehicleNode(Node):
             self.mode_switch_pub.publish(switch_msg)
 
             speed_msg = Float32()
-            speed_msg.data = float(self.odom_speed)
+            speed_msg.data = float(self.last_cmd_speed)
             self.current_speed_pub.publish(speed_msg)
+
+    def get_behavior_state_for_log(self):
+        if self.chaoche:
+            return 'CHAOCHE'
+        if self.Follow:
+            return 'FOLLOW'
+        return 'NORMAL'
+
+    def get_controller_source_for_log(self, mode):
+        if mode in (CONTROL_MODE_MPC_STEER, CONTROL_MODE_MPC_FULL):
+            return 'MPC'
+        return 'HEURISTIC_FALLBACK'
+
+    def format_battle_log(self, state, controller, speed, mpc_time_ms, mpc_fail_reason=None):
+        message = (
+            f"[Battle] state={state} controller={controller} "
+            f"speed={speed:.2f} m/s mpc_time={mpc_time_ms:.2f} ms"
+        )
+        if mpc_fail_reason:
+            message += f" mpc_fail={mpc_fail_reason}"
+        return message
+
+    def log_battle_summary(self):
+        self.get_logger().info(
+            self.format_battle_log(
+                state=self.current_behavior_state,
+                controller=self.get_controller_source_for_log(self.last_control_mode),
+                speed=self.last_cmd_speed,
+                mpc_time_ms=self.last_solve_time_ms,
+            )
+        )
     def publish_arrow_marker(self, max_dir_index, frame_id='laser'):
         marker = Marker()
         marker.header.frame_id = frame_id
@@ -310,7 +341,6 @@ class BattleVehicleNode(Node):
                 idx_end = int(Left_obs_orig[2 * i + 1])
                 obstacle_range = dis_90[idx_start: idx_end]
                 dis_obs_var = np.var(obstacle_range)
-                print('in filter_obstacles_by_variance,方差：', dis_obs_var)
                 Left_obs.append(idx_start)
                 Left_obs.append(idx_end)
         return Left_obs
@@ -359,7 +389,6 @@ class BattleVehicleNode(Node):
         average_intensity = np.mean(range_list)
         abs_tmp = abs(average_obs_intensity - average_intensity)
         if abs_tmp > 5:
-            print('detect dynamic obs abs_tmpabs_tmpabs_tmpabs_tmp!!!!', abs_tmp)
             return True
         return False
 
@@ -368,7 +397,6 @@ class BattleVehicleNode(Node):
         self.chaoche = False
         self.Follow = False
         self.D = 0.2
-        print('###########################################################')
 
         dis_90, inten_90 = self.get_range(data, -89, 91, True)
         dis_90 = dis_90[::-1]
@@ -419,7 +447,6 @@ class BattleVehicleNode(Node):
                 Left_obs_orig.append(i)
 
         if len(Left_obs_orig) % 2 == 1:
-            print('error!!!!!!!!!!!!')
             Left_obs_orig.pop()
 
         Left_obs = self.filter_small_obstacles(Left_obs_orig, min_obstacle_size=2)
@@ -438,9 +465,8 @@ class BattleVehicleNode(Node):
 
                 Left_obs[2 * i] = start_expand
                 Left_obs[2 * i + 1] = end_expand
-            print('有障碍物，障碍物是', Left_obs)
         else:
-            print('没有障碍物')
+            pass
 
         if len(Left_obs) > 0:
             for i in range(0, int(len(Left_obs) / 2) + 1, 1):
@@ -478,10 +504,8 @@ class BattleVehicleNode(Node):
                 elif right == 1 and max_dis_index > 90 and dis_obs_90[0] - 1 > dis_obs_90[lenth_dis - 1]:
                     max_dis_index = max_dis_index - 5 * abs(dis_obs_90[lenth_dis - 1] - dis_obs_90[0])
 
-            print('max_dis_index_temp', max_dis_index_temp)
             if len(Left_obs) == 2:
                 if max_dis_index_temp >= 89:
-                    print('turn right')
                     if Left_obs[0] >= 89:
                         max_dis_index = int((89 + Left_obs[0]) / 2)
                     elif Left_obs[1] <= 89:
@@ -490,13 +514,10 @@ class BattleVehicleNode(Node):
                         max_dis_index = max_dis_index_temp
                 else:
                     if Left_obs[0] >= 89:
-                        print('1')
                         max_dis_index = max_dis_index_temp
                     elif Left_obs[1] <= 89:
-                        print('2')
                         max_dis_index = int((89 + Left_obs[1]) / 2)
                     else:
-                        print('3')
                         max_dis_index = max_dis_index_temp
             if len(Left_obs) == 4:
                 middle_temp = int((Left_obs[1] + Left_obs[2]) / 2)
@@ -510,7 +531,6 @@ class BattleVehicleNode(Node):
                     else:
                         max_dis_index = max_dis_index_temp
                 else:
-                    print('turn left')
                     if Left_obs[0] > 89:
                         max_dis_index = max_dis_index_temp
                     elif Left_obs[0] <= 89 and middle_temp > 89:
@@ -527,24 +547,20 @@ class BattleVehicleNode(Node):
                 max_dir_num.append(i)
 
         if len(max_dir_num) % 2 == 1 and len(max_dir_num) != 1:
-            self.get_logger().error('出现单个不封闭区域，请检查障碍物检测逻辑')
+            pass
 
         if len(max_dir_num) == 1:
             if max_dir_num[0] < 90:
                 max_dir_index = int((max_dir_num[0]) / 2)
-                print('\033[32m转弯阶段1左转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             elif max_dir_num[0] > 90:
                 max_dir_index = int((max_dir_num[0] + lenth_dis - 2) / 2)
-                print('\033[32m转弯阶段1右转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             self.GO_STARIGHT = 0
 
         if len(max_dir_num) == 2:
-            print('找到 %d 个最大距离区域，区域大小 %d' % ((int(len(max_dir_num) / 2)), max_dir_num[1] - max_dir_num[0]))
             max_dir_index = int((max_dir_num[0] + max_dir_num[1]) / 2)
             max_dir_range = max_dir_num[1] - max_dir_num[0]
 
         if len(max_dir_num) > 2:
-            print('有多个最大距离区域，障碍物个数为:', len(Left_obs) / 2)
 
             if len(Left_obs) > 0:
                 self.dynamic_obs = self.DynamicObastcle(dis_list=dis_90, inten_list=inten_90, max_dir_num=max_dir_num, obs=Left_obs)
@@ -582,13 +598,11 @@ class BattleVehicleNode(Node):
             else:
                 max_dir_index += 2
 
-        print(max_dir_num, self.P)
         if max_dir_index >= 75 and max_dir_index <= 105:
             mean_straight = np.mean(dis_90_copy[80:100])
             self.GO_STARIGHT = 1
             self.TRANSITION = 0
             if self.last_in_straight and max_dir_range > 20:
-                print('在直道路段保持加速，最大距离朝向:', (max_dir_index - len(dis_90) / 2), ' 加速空间范围：', max_dir_range)
                 self.speed_rate *= 1.05
                 if mean_straight > 11 and len(Left_obs) == 0:
                     limit_rate = 1.8
@@ -601,19 +615,16 @@ class BattleVehicleNode(Node):
                 if self.speed_rate > limit_rate:
                     self.speed_rate = limit_rate
 
-                print('速度增益', self.speed_rate)
             else:
                 self.speed_rate = 1.1
 
             self.last_in_straight = True
         elif max_dir_index < 75 and max_dir_index > 0:
-            print('\033[32m转弯阶段2左转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             self.P = 1.5
             self.speed_rate = 1.0
             self.turn_rate = 0.8
             self.last_in_straight = False
         elif max_dir_index > 105:
-            print('\033[32m转弯阶段2右转，最大距离朝向: %s\033[0m' % (max_dir_index - lenth_dis / 2))
             self.P = 1.5
             self.speed_rate = 1.0
             self.turn_rate = 0.8
@@ -625,17 +636,16 @@ class BattleVehicleNode(Node):
                 for i in range(0, lenth_dis - 2, 1):
                     if dis_90[i + 1] - dis_90[i] > THRESHOLD_TURN:
                         max_dir_index = int((i + 1 + len(dis_90) / 2) / 2)
-                        self.get_logger().warn('进入过渡路段，前方左转，最大距离朝向: %f' % (max_dir_index - len(dis_90) / 2))
+                        pass
                         self.P = 0.8
                         normol = 0
                     elif dis_90[i] - dis_90[i + 1] > THRESHOLD_TURN:
                         max_dir_index = int((i + len(dis_90) / 2) / 2)
-                        self.get_logger().warn('进入过渡路段，前方右转，最大距离朝向: %f' % (max_dir_index - len(dis_90) / 2))
+                        pass
                         self.P = 0.8
                         normol = 0
                 if normol == 1:
                     max_dir_index = self.last_max_dir_index
-                    print('\033[38;5;208m隐藏款，无法判断方向，保持上一次动作并减速，最大距离朝向: %f\033[0m' % (max_dir_index - len(dis_90) / 2))
 
                     if self.last_in_normol:
                         self.speed_rate *= 0.9
@@ -675,16 +685,13 @@ class BattleVehicleNode(Node):
         max_dis = front_state['max_dis']
         max_dir_index = front_state['max_dir_index']
 
-        print('视野中最大距离是', max_dis)
 
         angle = 0.0
         if max_dir_index != 0:
             term1 = -max(math.exp(-max_dis / DIR_DETECT_THRESHOLD), 0.7) * (max_dir_index - 90) / 360 * math.pi
             term2 = (dis_90[0] - dis_90[lenth_dis - 1]) / (dis_90[0] + dis_90[lenth_dis - 1])
-            print(f'term1:{term1}, term2:{term2}')
             if dis_90[0] / dis_90[lenth_dis - 1] > 3 or dis_90[lenth_dis - 1] / dis_90[0] > 3:
                 self.D = 0.5
-                print('边界！！！！！！！！！！！！！！！！')
                 angle = 1.0 * term1 + 0.05 * term2
             else:
                 angle = 1.0 * term1 + 0.02 * term2
@@ -862,27 +869,10 @@ class BattleVehicleNode(Node):
         speed_cmd = float(min(speed_cmd, speed_upper_bound))
 
         if self.Follow:
-            print('\033[35m跟随！！22222！！跟随！！2222！！\033[0m')
             speed_cmd = float(min(self.follow_speed_cap, speed_cmd))
-        elif self.chaoche:
-            print('''
-            \033[31m   _____                         _____
-            \033[32m  / ____|                       / ____|
-            \033[33m | (___  _   _ _ __   ___ _ __  | |  __
-            \033[34m  \___ \| | | | '_ \ / _ \ '__| | | |_ |
-            \033[35m  ____) | |_| | |_) |  __/ |    | |__| |
-            \033[36m |_____/ \__,_| .__/ \___|_|     \_____|
-            \033[37m              | |
-            \033[35m              |_|   \033[5m超车模式启动！！！\033[0m
-            ''')
 
         drive_msg.drive.steering_angle = float(np.clip(steer_cmd, -math.pi / 4, math.pi / 4))
         drive_msg.drive.speed = float(np.clip(speed_cmd, 0.0, self.final_speed_cap))
-
-        if drive_msg.drive.steering_angle > 0:
-            print('转向左转%f度' % (abs(drive_msg.drive.steering_angle * 180 / math.pi)))
-        else:
-            print('转向右转%f度' % (abs(drive_msg.drive.steering_angle * 180 / math.pi)))
 
         self.publish_arrow_marker(front_state['max_dir_index'], current_frame)
         self.last_max_dir_index = front_state['max_dir_index']
@@ -903,8 +893,38 @@ class BattleVehicleNode(Node):
         ok_msg.data = bool(mpc_ok)
         self.mpc_ok_pub.publish(ok_msg)
 
+        self.current_behavior_state = self.get_behavior_state_for_log()
+        self.last_cmd_speed = float(drive_msg.drive.speed)
+        controller_source = self.get_controller_source_for_log(mode)
+
+        state_changed = self.current_behavior_state != self.last_logged_state
+        controller_changed = controller_source != self.last_logged_controller
+        if state_changed or controller_changed:
+            self.get_logger().info(
+                self.format_battle_log(
+                    state=self.current_behavior_state,
+                    controller=controller_source,
+                    speed=self.last_cmd_speed,
+                    mpc_time_ms=self.last_solve_time_ms,
+                )
+            )
+            self.last_logged_state = self.current_behavior_state
+            self.last_logged_controller = controller_source
+
         if mode == CONTROL_MODE_FALLBACK and self.mpc_enable:
-            self.get_logger().warn(f'MPC fallback: {mpc_reason}, solve_ms={mpc_solve_ms:.2f}')
+            if mpc_reason != self.last_warned_mpc_fail_reason:
+                self.get_logger().warn(
+                    self.format_battle_log(
+                        state=self.current_behavior_state,
+                        controller=controller_source,
+                        speed=self.last_cmd_speed,
+                        mpc_time_ms=self.last_solve_time_ms,
+                        mpc_fail_reason=mpc_reason,
+                    )
+                )
+                self.last_warned_mpc_fail_reason = mpc_reason
+        else:
+            self.last_warned_mpc_fail_reason = None
 
         self.last_control_mode = mode
         self.drive_pub.publish(drive_msg)
