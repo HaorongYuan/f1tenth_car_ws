@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>roboracer_china_2025</name>
+  <name>reactive_racing</name>
   <version>0.0.1</version>
-  <description>Battle fast2 reactive navigation node ported to ROS2 for F1TENTH.</description>
+  <description>Reactive racing heuristic navigation node for F1TENTH.</description>
 
   <maintainer email="jetson@todo.todo">jetson</maintainer>
   <license>Apache-2.0</license>

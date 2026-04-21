@@ -8,13 +8,13 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('scan_topic', default_value='/scan'),
         DeclareLaunchArgument('drive_topic', default_value='/drive'),
-        DeclareLaunchArgument('marker_topic', default_value='/battle_fast2/arrow_marker'),
-        DeclareLaunchArgument('debug_scan_topic', default_value='/battle_fast2/front_scan'),
+        DeclareLaunchArgument('marker_topic', default_value='/reactive_racing/arrow_marker'),
+        DeclareLaunchArgument('debug_scan_topic', default_value='/reactive_racing/front_scan'),
 
         Node(
-            package='roboracer_china_2025',
-            executable='battle_fast2_node',
-            name='battle_fast2_node',
+            package='reactive_racing',
+            executable='reactive_racing_node',
+            name='reactive_racing_node',
             output='screen',
             parameters=[{
                 'scan_topic': LaunchConfiguration('scan_topic'),

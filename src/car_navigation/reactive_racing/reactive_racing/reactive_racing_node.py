@@ -28,15 +28,15 @@ END_ANGLE = 60
 MIN_OBS_SPEED = 1.0
 
 
-class BattleVehicleNode(Node):
+class ReactiveRacingNode(Node):
     def __init__(self):
-        super().__init__('wall_following2')
+        super().__init__('reactive_racing_node')
 
         # ---- 话题参数: scan前端输入、最终控制输出与可视化调试 ----
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('marker_topic', '/arrow_marker_02')
-        self.declare_parameter('debug_scan_topic', '/front_scan_02')
+        self.declare_parameter('marker_topic', '/reactive_racing/arrow_marker')
+        self.declare_parameter('debug_scan_topic', '/reactive_racing/front_scan')
 
         # ---- Phase 3诊断参数: 控制台打印频率与统计发布开关 ----
         self.declare_parameter('diag_print_hz', 2.0)
@@ -54,7 +54,7 @@ class BattleVehicleNode(Node):
         self.publish_diag_topics = bool(self.get_parameter('publish_diag_topics').value)
 
 
-        # ---- 反应式前端状态: 保持与原battle_fast2一致，用于方向选择/避障/Follow/chaoche ----
+        # ---- 反应式前端状态: 用于方向选择、避障、Follow/chaoche ----
         # === 原逻辑成员变量 ===
         self.last_angle = 0.0
         self.last_max_dir_index = 0
@@ -93,8 +93,8 @@ class BattleVehicleNode(Node):
         self.marker_pub = self.create_publisher(Marker, marker_topic, 1)
 
         # 调试输出: 纯启发式控制命令与最终命令速度。
-        self.heuristic_pub = self.create_publisher(AckermannDriveStamped, 'battle_fast2/drive_heuristic', 10)
-        self.current_speed_pub = self.create_publisher(Float32, 'battle_fast2/current_speed_mps', 10)
+        self.heuristic_pub = self.create_publisher(AckermannDriveStamped, 'reactive_racing/drive_heuristic', 10)
+        self.current_speed_pub = self.create_publisher(Float32, 'reactive_racing/current_speed_mps', 10)
 
 
         # 诊断定时器: 周期打印实时速度和统计信息，便于命令行观测。
@@ -117,7 +117,7 @@ class BattleVehicleNode(Node):
         return 'NORMAL'
 
     def format_battle_log(self, state, speed):
-        return f"[Battle] state={state} controller=HEURISTIC speed={speed:.2f} m/s"
+        return f"[ReactiveRacing] state={state} controller=HEURISTIC speed={speed:.2f} m/s"
 
     def log_battle_summary(self):
         self.get_logger().info(self.format_battle_log(state=self.current_behavior_state, speed=self.last_cmd_speed))
@@ -631,13 +631,13 @@ class BattleVehicleNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    battle_node = BattleVehicleNode()
+    reactive_racing_node = ReactiveRacingNode()
     try:
-        rclpy.spin(battle_node)
+        rclpy.spin(reactive_racing_node)
     except KeyboardInterrupt:
         pass
     finally:
-        battle_node.destroy_node()
+        reactive_racing_node.destroy_node()
         rclpy.shutdown()
 
 
