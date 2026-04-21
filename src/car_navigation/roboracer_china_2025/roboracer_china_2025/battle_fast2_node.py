@@ -3,18 +3,16 @@
 
 import copy
 import math
-import time
 
 import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Point
-from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float32, UInt8, UInt32
+from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker
 
 # === 保持原代码的常量定义不变 ===
@@ -30,42 +28,15 @@ END_ANGLE = 60
 MIN_OBS_SPEED = 1.0
 
 
-# 控制模式编码: 0=纯启发式, 1=MPC仅接管转向, 2=MPC接管转向+速度, 3=MPC失败后的回退模式
-CONTROL_MODE_HEURISTIC = 0
-CONTROL_MODE_MPC_STEER = 1
-CONTROL_MODE_MPC_FULL = 2
-CONTROL_MODE_FALLBACK = 3
-
-
 class BattleVehicleNode(Node):
     def __init__(self):
         super().__init__('wall_following2')
 
-        # ---- 话题参数: scan前端输入、最终控制输出、可视化调试与里程计输入 ----
+        # ---- 话题参数: scan前端输入、最终控制输出与可视化调试 ----
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('drive_topic', '/drive')
         self.declare_parameter('marker_topic', '/arrow_marker_02')
         self.declare_parameter('debug_scan_topic', '/front_scan_02')
-        self.declare_parameter('odom_topic', '/odom')
-
-        # ---- MPC参数: 模式开关、时域长度、步长、候选离散度与速度/加速度边界 ----
-        self.declare_parameter('mpc_enable', False)
-        self.declare_parameter('mpc_mode', 'off')  # off | steer_only | full
-        self.declare_parameter('mpc_timeout_ms', 8.0)
-        self.declare_parameter('wheelbase', 0.25)
-        self.declare_parameter('horizon', 8)
-        self.declare_parameter('dt', 0.1)
-        self.declare_parameter('mpc_steer_candidates', 11)
-        self.declare_parameter('mpc_accel_candidates', 7)
-        self.declare_parameter('mpc_max_speed', 2.0)
-        self.declare_parameter('mpc_min_speed', 0.0)
-        self.declare_parameter('mpc_max_accel', 2.0)
-        self.declare_parameter('mpc_max_decel', -2.0)
-
-        # Phase 2 速度边界参数: Follow限速、超车限速、最终输出硬上限。
-        self.declare_parameter('follow_speed_cap', 1.0)
-        self.declare_parameter('chaoche_speed_cap', 2.0)
-        self.declare_parameter('final_speed_cap', 4.0)
 
         # ---- Phase 3诊断参数: 控制台打印频率与统计发布开关 ----
         self.declare_parameter('diag_print_hz', 2.0)
@@ -77,26 +48,6 @@ class BattleVehicleNode(Node):
         drive_topic = self.get_parameter('drive_topic').value
         marker_topic = self.get_parameter('marker_topic').value
         debug_scan_topic = self.get_parameter('debug_scan_topic').value
-        odom_topic = self.get_parameter('odom_topic').value
-
-        # 读取MPC运行参数（用于控制器行为与计算预算）
-        self.mpc_enable = bool(self.get_parameter('mpc_enable').value)
-        self.mpc_mode = str(self.get_parameter('mpc_mode').value)
-        self.mpc_timeout_ms = float(self.get_parameter('mpc_timeout_ms').value)
-        self.wheelbase = max(0.05, float(self.get_parameter('wheelbase').value))
-        self.mpc_horizon = max(3, int(self.get_parameter('horizon').value))
-        self.mpc_dt = max(0.02, float(self.get_parameter('dt').value))
-        self.mpc_steer_candidates = max(5, int(self.get_parameter('mpc_steer_candidates').value))
-        self.mpc_accel_candidates = max(3, int(self.get_parameter('mpc_accel_candidates').value))
-        self.mpc_max_speed = float(self.get_parameter('mpc_max_speed').value)
-        self.mpc_min_speed = float(self.get_parameter('mpc_min_speed').value)
-        self.mpc_max_accel = float(self.get_parameter('mpc_max_accel').value)
-        self.mpc_max_decel = float(self.get_parameter('mpc_max_decel').value)
-
-        # Phase 2 速度边界读取: 用于MPC求解上界与最终输出限幅。
-        self.follow_speed_cap = float(self.get_parameter('follow_speed_cap').value)
-        self.chaoche_speed_cap = float(self.get_parameter('chaoche_speed_cap').value)
-        self.final_speed_cap = float(self.get_parameter('final_speed_cap').value)
 
         # Phase 3诊断参数读取: 用于实时观测打印与话题统计发布。
         self.diag_print_hz = max(0.2, float(self.get_parameter('diag_print_hz').value))
@@ -120,34 +71,9 @@ class BattleVehicleNode(Node):
         self.dynamic_obs = False
         self.chaoche = False
 
-        # ---- 新增控制后端状态: odom缓存 + MPC上一帧输出 + 当前模式 ----
-        # === Odom 与控制状态 ===
-        self.have_odom = False
-        self.odom_speed = 0.0
-        self.odom_yaw = 0.0
-        self.last_mpc_steer = 0.0
-        self.last_mpc_speed = 0.0
-        self.last_control_mode = CONTROL_MODE_HEURISTIC
-
-        # 记录本帧MPC速度上界和回退原因，便于调参与问题定位。
-        self.current_speed_upper_bound = self.mpc_max_speed
-        self.last_mpc_reason = 'init'
-
-        # Phase 3统计状态: 求解耗时、回退触发率、模式切换次数等运行指标。
-        self.control_cycle_count = 0
-        self.mpc_attempt_count = 0
-        self.mpc_success_count = 0
-        self.fallback_trigger_count = 0
-        self.mode_switch_count = 0
-        self.last_solve_time_ms = 0.0
-        self.max_solve_time_ms = 0.0
-        self.sum_solve_time_ms = 0.0
-
-        # 日志缓存: 仅用于限流摘要、状态切换打印与MPC失败去重，不参与控制决策。
+        # 日志缓存: 仅用于状态摘要与调试观测，不参与控制决策。
         self.current_behavior_state = 'NORMAL'
         self.last_logged_state = None
-        self.last_logged_controller = None
-        self.last_warned_mpc_fail_reason = None
         self.last_cmd_speed = 0.0
 
 
@@ -158,67 +84,27 @@ class BattleVehicleNode(Node):
             depth=10
         )
 
-        # 新增订阅: /scan驱动前端流程，/odom提供MPC状态估计。
+        # 纯启发式版本只需要 scan 驱动前端与后端。
         self.scan_sub = self.create_subscription(LaserScan, scan_topic, self.middle_line_callback, qos_profile)
-        self.odom_sub = self.create_subscription(Odometry, odom_topic, self.odom_callback, 20)
 
         # 发布最终控制到drive_topic；其余发布器用于调试和可视化。
         self.drive_pub = self.create_publisher(AckermannDriveStamped, drive_topic, 1)
         self.scan_pub = self.create_publisher(LaserScan, debug_scan_topic, 10)
         self.marker_pub = self.create_publisher(Marker, marker_topic, 1)
 
-        # 调试输出: 启发式命令、MPC命令、模式码和MPC是否成功。
+        # 调试输出: 纯启发式控制命令与最终命令速度。
         self.heuristic_pub = self.create_publisher(AckermannDriveStamped, 'battle_fast2/drive_heuristic', 10)
-        self.mpc_pub = self.create_publisher(AckermannDriveStamped, 'battle_fast2/drive_mpc', 10)
-        self.mode_pub = self.create_publisher(UInt8, 'battle_fast2/control_mode', 10)
-        self.mpc_ok_pub = self.create_publisher(Bool, 'battle_fast2/mpc_ok', 10)
-
-        # Phase 3诊断话题: 发布求解耗时、回退率、模式切换计数和当前车速。
-        self.solve_time_pub = self.create_publisher(Float32, 'battle_fast2/mpc_solve_time_ms', 10)
-        self.fallback_rate_pub = self.create_publisher(Float32, 'battle_fast2/fallback_rate', 10)
-        self.mode_switch_pub = self.create_publisher(UInt32, 'battle_fast2/mode_switch_count', 10)
         self.current_speed_pub = self.create_publisher(Float32, 'battle_fast2/current_speed_mps', 10)
 
 
         # 诊断定时器: 周期打印实时速度和统计信息，便于命令行观测。
         self.diag_timer = self.create_timer(1.0 / self.diag_print_hz, self.diagnostic_timer_callback)
 
-    # Odom回调仅缓存当前速度与航向，不在此处直接发布控制。
-    def odom_callback(self, msg: Odometry):
-        self.have_odom = True
-        self.odom_speed = float(msg.twist.twist.linear.x)
-        qx = msg.pose.pose.orientation.x
-        qy = msg.pose.pose.orientation.y
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        siny_cosp = 2.0 * (qw * qz + qx * qy)
-        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-        self.odom_yaw = math.atan2(siny_cosp, cosy_cosp)
-
-
-    # 预留接口: 接收外部safety节点状态，当前仅缓存用于观测。
-
     # Phase 3诊断回调: 以固定频率输出统一摘要日志，不在每个控制周期刷屏。
     def diagnostic_timer_callback(self):
         self.log_battle_summary()
 
         if self.publish_diag_topics:
-            solve_msg = Float32()
-            solve_msg.data = float(self.last_solve_time_ms)
-            self.solve_time_pub.publish(solve_msg)
-
-            fallback_rate = 0.0
-            if self.mpc_attempt_count > 0:
-                fallback_rate = self.fallback_trigger_count / float(self.mpc_attempt_count)
-
-            rate_msg = Float32()
-            rate_msg.data = float(fallback_rate)
-            self.fallback_rate_pub.publish(rate_msg)
-
-            switch_msg = UInt32()
-            switch_msg.data = int(self.mode_switch_count)
-            self.mode_switch_pub.publish(switch_msg)
-
             speed_msg = Float32()
             speed_msg.data = float(self.last_cmd_speed)
             self.current_speed_pub.publish(speed_msg)
@@ -230,29 +116,12 @@ class BattleVehicleNode(Node):
             return 'FOLLOW'
         return 'NORMAL'
 
-    def get_controller_source_for_log(self, mode):
-        if mode in (CONTROL_MODE_MPC_STEER, CONTROL_MODE_MPC_FULL):
-            return 'MPC'
-        return 'HEURISTIC_FALLBACK'
-
-    def format_battle_log(self, state, controller, speed, mpc_time_ms, mpc_fail_reason=None):
-        message = (
-            f"[Battle] state={state} controller={controller} "
-            f"speed={speed:.2f} m/s mpc_time={mpc_time_ms:.2f} ms"
-        )
-        if mpc_fail_reason:
-            message += f" mpc_fail={mpc_fail_reason}"
-        return message
+    def format_battle_log(self, state, speed):
+        return f"[Battle] state={state} controller=HEURISTIC speed={speed:.2f} m/s"
 
     def log_battle_summary(self):
-        self.get_logger().info(
-            self.format_battle_log(
-                state=self.current_behavior_state,
-                controller=self.get_controller_source_for_log(self.last_control_mode),
-                speed=self.last_cmd_speed,
-                mpc_time_ms=self.last_solve_time_ms,
-            )
-        )
+        self.get_logger().info(self.format_battle_log(state=self.current_behavior_state, speed=self.last_cmd_speed))
+
     def publish_arrow_marker(self, max_dir_index, frame_id='laser'):
         marker = Marker()
         marker.header.frame_id = frame_id
@@ -716,217 +585,37 @@ class BattleVehicleNode(Node):
             'base_speed': float(speed),
         }
 
-    def build_local_ref(self, front_state, target_speed, speed_upper_bound):
-        # 局部参考点定义在 base_link: x前向, y左向。
-        # speed_upper_bound 是本帧可用最高速度（由Follow/chaoche/全局上限共同决定）。
-        target_heading = (float(front_state['max_dir_index']) - 90.0) / 180.0 * math.pi
-        target_heading = float(np.clip(target_heading, -0.9, 0.9))
-
-        x_ref = np.zeros(self.mpc_horizon)
-        y_ref = np.zeros(self.mpc_horizon)
-        yaw_ref = np.zeros(self.mpc_horizon)
-        v_ref = np.zeros(self.mpc_horizon)
-
-        v_des = float(np.clip(target_speed, max(self.mpc_min_speed, 0.0), speed_upper_bound))
-        for k in range(self.mpc_horizon):
-            s = (k + 1) * self.mpc_dt * max(v_des, 0.3)
-            x_ref[k] = s * math.cos(target_heading)
-            y_ref[k] = s * math.sin(target_heading)
-            yaw_ref[k] = target_heading
-            v_ref[k] = v_des
-
-        return {
-            'x': x_ref,
-            'y': y_ref,
-            'yaw': yaw_ref,
-            'v': v_ref,
-        }
-
-    def rollout_cost(self, steer, accel, state, ref, speed_upper_bound):
-        x = 0.0
-        y = 0.0
-        yaw = 0.0
-        v = float(state['v'])
-
-        cost = 0.0
-        for k in range(self.mpc_horizon):
-            x += v * math.cos(yaw) * self.mpc_dt
-            y += v * math.sin(yaw) * self.mpc_dt
-            yaw += v / self.wheelbase * math.tan(steer) * self.mpc_dt
-            v = np.clip(v + accel * self.mpc_dt, self.mpc_min_speed, speed_upper_bound)
-
-            ex = x - ref['x'][k]
-            ey = y - ref['y'][k]
-            eyaw = (yaw - ref['yaw'][k] + math.pi) % (2 * math.pi) - math.pi
-            ev = v - ref['v'][k]
-
-            cost += 2.0 * ex * ex + 3.0 * ey * ey + 0.8 * eyaw * eyaw + 0.3 * ev * ev
-            cost += 0.05 * steer * steer + 0.02 * accel * accel
-            cost += 0.12 * (steer - self.last_mpc_steer) * (steer - self.last_mpc_steer)
-
-        return float(cost), float(v)
-
-    def solve_mpc(self, front_state, heuristic, speed_upper_bound):
-        if not self.have_odom:
-            return False, heuristic['steering'], heuristic['speed'], 'no_odom', 0.0
-
-        ref = self.build_local_ref(front_state, heuristic['speed'], speed_upper_bound)
-        start_t = time.monotonic()
-        timeout_s = self.mpc_timeout_ms / 1000.0
-
-        steer_grid = np.linspace(-math.pi / 4, math.pi / 4, self.mpc_steer_candidates)
-        accel_grid = [0.0]
-        if self.mpc_mode == 'full':
-            accel_grid = np.linspace(self.mpc_max_decel, self.mpc_max_accel, self.mpc_accel_candidates)
-
-        state = {'v': float(abs(self.odom_speed))}
-
-        best_cost = float('inf')
-        best_steer = heuristic['steering']
-        best_speed = heuristic['speed']
-
-        for steer in steer_grid:
-            for accel in accel_grid:
-                if time.monotonic() - start_t > timeout_s:
-                    elapsed_ms = (time.monotonic() - start_t) * 1000.0
-                    return False, heuristic['steering'], heuristic['speed'], 'timeout', elapsed_ms
-                cost, vend = self.rollout_cost(steer=float(steer), accel=float(accel), state=state, ref=ref, speed_upper_bound=speed_upper_bound)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_steer = float(steer)
-                    if self.mpc_mode == 'full':
-                        best_speed = float(np.clip(vend, self.mpc_min_speed, speed_upper_bound))
-
-        self.last_mpc_steer = best_steer
-        self.last_mpc_speed = best_speed
-        elapsed_ms = (time.monotonic() - start_t) * 1000.0
-        return True, best_steer, best_speed, 'ok', elapsed_ms
-
-    def fallback_guard(self, mpc_ok, heuristic):
-        if mpc_ok:
-            return False, ''
-        return True, 'fallback_heuristic'
-
     def control_select_and_publish(self, data, current_frame, front_state, heuristic):
         drive_msg = AckermannDriveStamped()
         drive_msg.header = data.header
 
-        heuristic_msg = AckermannDriveStamped()
-        heuristic_msg.header = data.header
-        heuristic_msg.drive.steering_angle = float(heuristic['steering'])
-        heuristic_msg.drive.speed = float(heuristic['speed'])
-
-        mode = CONTROL_MODE_HEURISTIC
-        mpc_ok = False
         steer_cmd = heuristic['steering']
         speed_cmd = heuristic['speed']
-        mpc_reason = 'disabled'
-        mpc_solve_ms = 0.0
 
-        # Phase 3统计: 每帧控制循环计数。
-        self.control_cycle_count += 1
-
-        # Phase 2: 先计算本帧速度上界，再传给MPC，确保full模式输出天然满足业务速度边界。
-        speed_upper_bound = self.mpc_max_speed
+        # 保留启发式 Follow 语义，但调整速度限制以适应更激进的跟车行为。
         if self.Follow:
-            speed_upper_bound = min(speed_upper_bound, self.follow_speed_cap)
-        elif self.chaoche:
-            speed_upper_bound = min(speed_upper_bound, self.chaoche_speed_cap)
-        speed_upper_bound = float(min(speed_upper_bound, self.final_speed_cap))
-        self.current_speed_upper_bound = speed_upper_bound
-
-        if self.mpc_enable and self.mpc_mode in ('steer_only', 'full'):
-            self.mpc_attempt_count += 1
-            mpc_ok, mpc_steer, mpc_speed, mpc_reason, mpc_solve_ms = self.solve_mpc(front_state, heuristic, speed_upper_bound)
-            if mpc_ok:
-                if self.mpc_mode == 'steer_only':
-                    mode = CONTROL_MODE_MPC_STEER
-                    steer_cmd = mpc_steer
-                else:
-                    mode = CONTROL_MODE_MPC_FULL
-                    steer_cmd = mpc_steer
-                    speed_cmd = mpc_speed
-            else:
-                mode = CONTROL_MODE_FALLBACK
-
-        fallback, _ = self.fallback_guard(mpc_ok or mode == CONTROL_MODE_HEURISTIC, heuristic)
-        if fallback:
-            steer_cmd = heuristic['steering']
-            speed_cmd = heuristic['speed']
-        self.last_mpc_reason = mpc_reason
-        # Phase 3统计: 求解耗时、成功次数、回退次数与模式切换次数。
-        self.last_solve_time_ms = float(mpc_solve_ms)
-        if mpc_ok:
-            self.mpc_success_count += 1
-            self.sum_solve_time_ms += float(mpc_solve_ms)
-            self.max_solve_time_ms = max(self.max_solve_time_ms, float(mpc_solve_ms))
-        if mode == CONTROL_MODE_FALLBACK:
-            self.fallback_trigger_count += 1
-        if mode != self.last_control_mode:
-            self.mode_switch_count += 1
-
-        # 二次保险: 最终输出再次做统一速度边界限幅，防止异常参数造成越界。
-        speed_cmd = float(min(speed_cmd, speed_upper_bound))
-
-        if self.Follow:
-            speed_cmd = float(min(self.follow_speed_cap, speed_cmd))
+            speed_cmd = float(min(MIN_OBS_SPEED, speed_cmd))
 
         drive_msg.drive.steering_angle = float(np.clip(steer_cmd, -math.pi / 4, math.pi / 4))
-        drive_msg.drive.speed = float(np.clip(speed_cmd, 0.0, self.final_speed_cap))
+        drive_msg.drive.speed = float(max(0.0, speed_cmd))
 
         self.publish_arrow_marker(front_state['max_dir_index'], current_frame)
         self.last_max_dir_index = front_state['max_dir_index']
 
-        mpc_msg = AckermannDriveStamped()
-        mpc_msg.header = data.header
-        mpc_msg.drive.steering_angle = float(np.clip(self.last_mpc_steer, -math.pi / 4, math.pi / 4))
-        mpc_msg.drive.speed = float(np.clip(self.last_mpc_speed, 0.0, self.mpc_max_speed))
+        heuristic_msg = AckermannDriveStamped()
+        heuristic_msg.header = data.header
+        heuristic_msg.drive.steering_angle = drive_msg.drive.steering_angle
+        heuristic_msg.drive.speed = drive_msg.drive.speed
 
         self.heuristic_pub.publish(heuristic_msg)
-        self.mpc_pub.publish(mpc_msg)
-
-        mode_msg = UInt8()
-        mode_msg.data = int(mode)
-        self.mode_pub.publish(mode_msg)
-
-        ok_msg = Bool()
-        ok_msg.data = bool(mpc_ok)
-        self.mpc_ok_pub.publish(ok_msg)
 
         self.current_behavior_state = self.get_behavior_state_for_log()
         self.last_cmd_speed = float(drive_msg.drive.speed)
-        controller_source = self.get_controller_source_for_log(mode)
 
-        state_changed = self.current_behavior_state != self.last_logged_state
-        controller_changed = controller_source != self.last_logged_controller
-        if state_changed or controller_changed:
-            self.get_logger().info(
-                self.format_battle_log(
-                    state=self.current_behavior_state,
-                    controller=controller_source,
-                    speed=self.last_cmd_speed,
-                    mpc_time_ms=self.last_solve_time_ms,
-                )
-            )
+        if self.current_behavior_state != self.last_logged_state:
+            self.get_logger().info(self.format_battle_log(state=self.current_behavior_state, speed=self.last_cmd_speed))
             self.last_logged_state = self.current_behavior_state
-            self.last_logged_controller = controller_source
 
-        if mode == CONTROL_MODE_FALLBACK and self.mpc_enable:
-            if mpc_reason != self.last_warned_mpc_fail_reason:
-                self.get_logger().warn(
-                    self.format_battle_log(
-                        state=self.current_behavior_state,
-                        controller=controller_source,
-                        speed=self.last_cmd_speed,
-                        mpc_time_ms=self.last_solve_time_ms,
-                        mpc_fail_reason=mpc_reason,
-                    )
-                )
-                self.last_warned_mpc_fail_reason = mpc_reason
-        else:
-            self.last_warned_mpc_fail_reason = None
-
-        self.last_control_mode = mode
         self.drive_pub.publish(drive_msg)
 
     def middle_line_callback(self, data):
