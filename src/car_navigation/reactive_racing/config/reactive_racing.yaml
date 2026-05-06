@@ -1,0 +1,293 @@
+#
+# 这是 reactive_racing 的默认参数入口。
+# `reactive_racing.launch.py` 会默认加载这个文件；launch 里的话题参数会覆盖这里的同名项。
+# 如果只想微调反应式算法，优先改这里，不要直接改 `reactive_racing_node.py`。
+#
+
+reactive_racing_node:
+  ros__parameters:
+    # === 1. 话题与节点接口 ===
+    # 这一组只决定节点和外部 ROS 图的接线方式，不会改变核心避障逻辑。
+
+    # 订阅的激光雷达话题。
+    # 类型是 ROS 话题名字符串；改这里用于把算法接到不同的 scan 源。
+    scan_topic: /scan
+
+    # 发布最终 Ackermann 控制指令的话题。
+    # 改成别的话题时，车辆控制链路会切到新的 drive 接口。
+    drive_topic: /drive
+
+    # 发布方向箭头 Marker 的话题。
+    # 只影响 RViz 可视化，不影响控制输出。
+    marker_topic: /reactive_racing/arrow_marker
+
+    # 发布裁剪后前向扫描的调试话题。
+    # 用于观察前端看到的前向扇区数据，不会直接改变控制结果。
+    debug_scan_topic: /reactive_racing/front_scan
+
+    # 发布启发式控制结果镜像的调试话题。
+    # 方便和最终 drive 输出对照，通常只有调试或录包时才会改。
+    heuristic_drive_topic: reactive_racing/drive_heuristic
+
+    # 发布当前指令速度的调试话题。
+    # 只用于观测运行时速度，不参与任何闭环控制。
+    current_speed_topic: reactive_racing/current_speed_mps
+
+    # === 2. 诊断与调试发布 ===
+    # 这一组控制日志打印和调试话题的发布节奏。
+
+    # 周期性诊断日志的打印频率，单位 Hz。
+    # 值越大，终端刷新越频繁；值越小，更安静但问题定位会更慢。
+    diag_print_hz: 2.0
+
+    # 是否发布 `current_speed_topic` 这类诊断话题。
+    # 关闭后能减少调试流量，但不会影响核心控制逻辑。
+    publish_diag_topics: true
+
+    # === 3. 前端扫描采样与距离裁剪 ===
+    # 这一组对应 `get_dis`、`get_range` 和 `frontend_scan_process` 的最前面几步。
+
+    # 前向扫描起始角，单位度。
+    # 这个值越小，纳入的左侧视野越大；过大则会缩窄左前方视野。
+    frontend_scan_start_deg: -89
+
+    # 前向扫描结束角，单位度，采用 Python `range` 的右开区间语义。
+    # 值越大，纳入的右侧视野越大；减小会缩窄右前方视野。
+    frontend_scan_end_deg: 91
+
+    # `get_dis` 采样窗口在当前角点左侧取多少个点。
+    # 值越大，抗单点噪声更强，但会降低局部尖锐变化的响应速度。
+    frontend_sample_window_left_points: 2
+
+    # `get_dis` 采样窗口在当前角点右侧切片终点前取多少个点。
+    # 值越大，右侧平滑更强；它和左侧点数一起决定局部采样窗口宽度。
+    frontend_sample_window_right_points: 2
+
+    # 局部采样窗口排序后选第几个点作为有效距离，从 0 开始计数。
+    # 值越大，越偏向保守距离估计；值越小，对近距离异常点更敏感。
+    frontend_sample_order_index: 2
+
+    # 搜索最大前向距离时，两端忽略的边缘点数量。
+    # 值越大，越不容易被极边缘射线主导方向判断；值越小，边缘更容易影响结果。
+    frontend_max_distance_search_margin: 20
+
+    # 前端“可通行方向”检测的距离裁剪上限，单位米。
+    # 值越大，更多区域会被视作可通行；值越小，可行方向判定更保守。
+    frontend_dir_detect_threshold: 2.5
+
+    # 前端“障碍边缘”检测的距离裁剪上限，单位米。
+    # 值越大，障碍检测会参考更远的物体；值越小，更强调近距离障碍。
+    frontend_obs_detect_threshold: 5.0
+
+    # 异常值过滤时，在角度维度向两侧检查的窗口半宽，单位点数。
+    # 值越大，补洞和平滑更强；值越小，保留原始细节更多。
+    frontend_anomaly_angle_range: 2
+
+    # === 4. 障碍检测、过滤与膨胀 ===
+    # 这一组对应前端障碍边缘提取、小障碍过滤和障碍膨胀逻辑。
+
+    # 相邻距离差超过多少才认为遇到了障碍边缘，单位米。
+    # 值越小，越容易把变化当成障碍边缘；值越大，边缘检测更迟钝。
+    obstacle_edge_threshold: 0.5
+
+    # 小于等于该宽度的障碍会被当成小噪声去掉，单位点数。
+    # 值越大，越激进地忽略小目标；值越小，会保留更多细小障碍。
+    obstacle_small_max_width: 2
+
+    # 障碍膨胀时的距离参考值，单位米。
+    # 值越大，近距离障碍会被扩得更宽；值越小，膨胀范围会收缩。
+    obstacle_expand_distance_ref: 4.0
+
+    # 单侧障碍膨胀允许的最大扩展点数。
+    # 值越大，膨胀上限越宽，车辆更保守；值越小，更容易贴边通过。
+    obstacle_expand_max_points: 10.0
+
+    # 动态障碍判断时，障碍区域与周围区域的平均反射强度差阈值。
+    # 值越小，越容易进入 `FOLLOW` / `CHAOCHE` 动态障碍逻辑；值越大，更难触发。
+    dynamic_obs_intensity_delta_threshold: 5.0
+
+    # === 5. 可行方向 / 缝隙选择与动态障碍判定 ===
+    # 这一组决定在多个候选缝隙中如何偏向、如何触发跟车或超车语义。
+
+    # 左右距离差达到多少时，才对可行方向中心施加侧向偏置，单位米。
+    # 值越小，方向偏置更容易触发；值越大，只在明显不对称时才偏置。
+    selection_side_bias_distance_delta_threshold: 1.0
+
+    # 左右不对称时，对可行方向中心施加的偏置增益。
+    # 值越大，缝隙中心更容易被推向看起来更开阔的一侧；值越小，影响更弱。
+    selection_side_bias_gain: 5.0
+
+    # 多个候选缝隙里，被视为“足够宽”的最小宽度，单位点数。
+    # 值越大，只有更宽的缝隙才会参与优先选择；值越小，候选会更多。
+    selection_candidate_gap_min_width: 18
+
+    # 动态障碍场景下，被视为“可超车缝隙”的最小宽度，单位点数。
+    # 值越大，更难进入 `CHAOCHE`；值越小，更容易尝试超车。
+    selection_overtake_gap_min_width: 30
+
+    # 最终方向中心在左右两侧额外偏移的点数。
+    # 值越大，方向会更激进地远离缝隙中心；值越小，方向更贴近原中心。
+    selection_direction_bias_offset: 2
+
+    # === 6. 后端控制、转向限制、速度模型与状态机 ===
+    # 这一组对应 `heuristic_backend_control` 和直道 / 转弯 / 过渡状态机。
+
+    # 节点启动后默认使用的基础 P 增益。
+    # 值越大，默认转向更敏捷；值越小，更平缓。
+    control_normal_p_gain: 1.1
+
+    # 识别为明显转弯时切换到的 P 增益。
+    # 值越大，转弯会更积极；值越小，转弯更保守。
+    control_turn_p_gain: 1.5
+
+    # 进入过渡补救逻辑时使用的 P 增益。
+    # 值越大，过渡阶段修正更迅速；值越小，过渡更柔和。
+    control_transition_p_gain: 0.8
+
+    # 每个控制周期开始时恢复的基础 D 增益。
+    # 值越大，转向对角度变化更敏感；值越小，阻尼更弱。
+    control_base_d_gain: 0.2
+
+    # 左右距离极不对称时切换到的 D 增益。
+    # 值越大，墙面不平衡时转向抑制更强；值越小，保持更灵活。
+    control_asymmetry_d_gain: 0.5
+
+    # 判断左右距离是否“极不对称”的比例阈值。
+    # 值越小，更容易触发不对称修正；值越大，只有极端情况才会触发。
+    control_distance_ratio_threshold: 3.0
+
+    # 前向距离衰减项 `exp(-max_dis / threshold)` 的最小下限。
+    # 值越大，远距离时依然保持更强的方向引导；值越小，远距离时衰减更明显。
+    control_term1_decay_floor: 0.7
+
+    # 左右距离较平衡且有明确方向时，侧向修正项的增益。
+    # 值越大，转向更受左右距离差影响；值越小，更依赖主方向项。
+    control_term2_gain_balanced: 0.02
+
+    # 左右距离明显不平衡且有明确方向时，侧向修正项的增益。
+    # 值越大，更积极地远离近侧障碍；值越小，更贴近主方向。
+    control_term2_gain_unbalanced: 0.05
+
+    # 没有明确方向但左右距离较平衡时，侧向修正项的增益。
+    # 值越大，零方向场景也会更积极靠左右差来修正；值越小，更稳。
+    control_term2_gain_zero_balanced: 0.05
+
+    # 没有明确方向且左右距离明显不平衡时，侧向修正项的增益。
+    # 值越大，极端狭窄场景下躲闪更激进；值越小，更保守。
+    control_term2_gain_zero_unbalanced: 0.1
+
+    # 最终转向裁剪上限，单位弧度。
+    # 值越大，允许更大的舵角；值越小，转向会更受限。
+    control_steering_limit_rad: 0.7853981633974483
+
+    # `FOLLOW` 状态下的速度上限，单位 m/s。
+    # 值越大，跟车更激进；值越小，跟车更稳妥。
+    control_follow_speed_cap: 1.0
+
+    # 基础速度模型的整体缩放系数。
+    # 值越大，全局速度都会抬高；值越小，全局速度会下降。
+    speed_model_scale: 1.8
+
+    # 速度模型里指数衰减项的权重。
+    # 值越大，速度对转角更敏感；值越小，直行和转弯速度差更小。
+    speed_model_angle_decay_weight: 0.3
+
+    # 速度模型里的常量底座权重。
+    # 值越大，转弯时仍保留更高的基础速度；值越小，速度更依赖转角。
+    speed_model_base_weight: 0.7
+
+    # 速度模型中参与指数衰减的转角裁剪上限，单位弧度。
+    # 值越大，大转角时速度下降会更缓；值越小，较早进入饱和衰减。
+    speed_model_angle_clip: 0.5
+
+    # 被视为“基本直道”的方向中心带宽半宽，单位点数。
+    # 值越大，更容易进入直道逻辑；值越小，只有更接近正前方才算直道。
+    straight_band_half_width: 15
+
+    # 直道平均距离统计窗口的半宽，单位点数。
+    # 值越大，直道距离估计更平滑；值越小，更灵敏但更容易抖动。
+    straight_mean_window_half_width: 10
+
+    # 连续直道加速前要求的最小缝隙宽度，单位点数。
+    # 值越大，只有宽直道才会继续加速；值越小，普通直道也容易提速。
+    straight_gap_min_width: 20
+
+    # 连续处于直道时，速度倍率每周期增长的乘数。
+    # 值越大，直道提速更快；值越小，提速更缓。
+    straight_speed_growth: 1.05
+
+    # 新进入直道但还未连续加速时的速度倍率重置值。
+    # 值越大，直道初始就更快；值越小，进入直道后更谨慎。
+    straight_speed_rate_reset: 1.1
+
+    # 直道非常开阔时的距离阈值，单位米。
+    # 值越小，更容易认为是“大直道”；值越大，只有很开阔才会触发最高速率。
+    straight_distance_far: 11.0
+
+    # 直道中等开阔时的距离阈值，单位米。
+    # 它和 `straight_distance_far` / `straight_distance_near` 一起决定速度倍率分档。
+    straight_distance_mid: 8.0
+
+    # 直道较短但仍可提速时的距离阈值，单位米。
+    # 值越小，更容易拿到轻微提速；值越大，则需要更长直道才会加速。
+    straight_distance_near: 7.0
+
+    # 对应 `straight_distance_far` 档位的速度倍率上限。
+    # 值越大，长直道最高速更高；值越小，会更保守。
+    straight_speed_limit_far: 1.8
+
+    # 对应 `straight_distance_mid` 档位的速度倍率上限。
+    # 它是中等直道场景下的提速上限。
+    straight_speed_limit_mid: 1.5
+
+    # 对应 `straight_distance_near` 档位的速度倍率上限。
+    # 值越大，短直道也会提速更多；值越小，短直道更谨慎。
+    straight_speed_limit_near: 1.3
+
+    # 不满足直道提速条件时的默认速度倍率上限。
+    # 这相当于“保持但不额外加速”的保底倍率。
+    straight_speed_limit_default: 1.0
+
+    # 识别为转弯时采用的速度倍率。
+    # 值越大，弯中更快；值越小，转弯更保守。
+    turn_state_speed_rate: 1.0
+
+    # 识别为转弯时采用的转向倍率。
+    # 值越大，转向指令放大更多；值越小，转向会更钝。
+    turn_state_turn_rate: 0.8
+
+    # 无明确缝隙时，用于检测转向突变的阈值，单位米。
+    # 值越小，越容易进入过渡补救逻辑；值越大，触发更困难。
+    transition_turn_threshold: 0.5
+
+    # 连续停留在过渡补救逻辑中时，速度倍率每周期的衰减乘数。
+    # 值越小，速度掉得越快；值越接近 1，减速越慢。
+    transition_speed_decay: 0.9
+
+    # 过渡补救逻辑允许的最低速度倍率。
+    # 值越小，允许更慢地稳住车辆；值越大，保持更高的最低速度。
+    transition_speed_min: 0.5
+
+    # 连续处于过渡补救逻辑中时，转向倍率每周期的增长乘数。
+    # 值越大，补救转向更激进；值越小，补救更平缓。
+    transition_turn_rate_growth: 1.2
+
+    # 过渡补救逻辑允许的最大转向倍率。
+    # 值越大，允许更激进的补救转向；值越小，上限更严格。
+    transition_turn_rate_max: 2.5
+
+    # 第一次进入“无缝隙但继续沿历史方向”时的速度倍率重置值。
+    # 值越大，第一次补救时还会保持较高速度；值越小，更保守。
+    transition_speed_reset: 0.9
+
+    # 第一次进入“无缝隙但继续沿历史方向”时的转向倍率重置值。
+    # 值越大，第一次补救就更积极；值越小，更温和。
+    transition_turn_rate_reset: 1.2
+
+    # 过渡逻辑中成功识别到新的转向趋势后，速度倍率重置值。
+    # 值越大，重新找到趋势后恢复更快；值越小，仍然保持谨慎。
+    transition_normal_speed_reset: 1.0
+
+    # 过渡逻辑中成功识别到新的转向趋势后，转向倍率重置值。
+    # 值越大，恢复后仍然较激进；值越小，恢复得更平稳。
+    transition_normal_turn_rate_reset: 1.0
